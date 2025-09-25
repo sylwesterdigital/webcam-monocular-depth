@@ -3,6 +3,10 @@
 Real-time “holographic” point cloud in the browser.
 Python reads a webcam, estimates per-pixel depth with MiDaS, streams depth+RGB over WebSocket; a Three.js client unprojects to 3D and renders a colored point cloud with **smooth tweening** between frames.
 
+## Demo
+
+https://github.com/user-attachments/assets/1cb5da49-d9f7-46f6-a85b-b25ac00eb140
+
 ---
 
 ## Features
