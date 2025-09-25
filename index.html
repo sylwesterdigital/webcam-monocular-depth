@@ -1,0 +1,154 @@
+<!-- client/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Depth Point Cloud</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    #overlay { position:fixed; top:12px; left:12px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.4); padding:8px 10px; border-radius:8px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">connecting…</div>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    const overlay = document.getElementById("overlay");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    const material = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
+    let geom = new THREE.BufferGeometry();
+    let points = new THREE.Points(geom, material);
+    scene.add(points);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // Parse incoming binary frames:
+    // [header_len(uint32)][header(JSON)][depth float32 (w*h)][rgb u8 (3*w*h)]
+    function parseFrame(buffer) {
+      const dv = new DataView(buffer);
+      const headerLen = dv.getUint32(0, true);
+      let offset = 4;
+      const headerStr = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen));
+      offset += headerLen;
+      if (headerLen === 0) return { hello: true };
+
+      const header = JSON.parse(headerStr);
+      const N = header.w * header.h;
+
+      const depth = new Float32Array(buffer, offset, N);
+      offset += N * 4;
+
+      const rgb = new Uint8Array(buffer, offset, N * 3);
+
+      return { header, depth, rgb };
+    }
+
+    function updatePointCloud({ header, depth, rgb }) {
+      const { w, h, fx, fy, cx, cy } = header;
+      // allocate once if size changed
+      const N = w * h;
+      if (!geom.attributes.position || geom.attributes.position.count !== N) {
+        geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+        geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      }
+      const pos = geom.attributes.position.array;
+      const col = geom.attributes.color.array;
+
+      // Unproject each pixel center -> 3D (pinhole)
+      // X = (u - cx) / fx * Z ; Y = (v - cy) / fy * Z ; Z = depth
+      let k = 0, c = 0;
+      for (let v = 0; v < h; v++) {
+        for (let u = 0; u < w; u++) {
+          const i = v * w + u;
+          const Z = depth[i];
+          const X = (u - cx) / fx * Z;
+          const Y = (v - cy) / fy * Z;
+
+          pos[k++] =  X;
+          pos[k++] = -Y;   // flip Y for a more natural orientation
+          pos[k++] = -Z;   // look into -Z
+
+          const r = rgb[c++] / 255;
+          const g = rgb[c++] / 255;
+          const b = rgb[c++] / 255;
+          col[i*3    ] = r;
+          col[i*3 + 1] = g;
+          col[i*3 + 2] = b;
+        }
+      }
+      geom.attributes.position.needsUpdate = true;
+      geom.attributes.color.needsUpdate = true;
+      geom.computeBoundingSphere();
+    }
+
+    // Simple FPS/status
+    let lastTs = performance.now(), frames = 0;
+    let statusText = "connecting…";
+    function tickOverlay() {
+      const now = performance.now();
+      frames++;
+      if (now - lastTs >= 1000) {
+        overlay.textContent = statusText + ` | ${frames} fps`;
+        frames = 0;
+        lastTs = now;
+      }
+      requestAnimationFrame(tickOverlay);
+    }
+    tickOverlay();
+
+    // Connect to Python server
+    const ws = new WebSocket("ws://localhost:8765");
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      statusText = "connected";
+    };
+
+    ws.onmessage = (ev) => {
+      const parsed = parseFrame(ev.data);
+      if (parsed.hello) return;
+      updatePointCloud(parsed);
+      statusText = `w=${parsed.header.w} h=${parsed.header.h}`;
+    };
+
+    ws.onclose = () => {
+      statusText = "disconnected";
+    };
+
+    (function render() {
+      requestAnimationFrame(render);
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+  </script>
+</body>
+</html>
