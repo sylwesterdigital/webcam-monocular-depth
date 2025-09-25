@@ -51,15 +51,46 @@
       renderer.setSize(innerWidth, innerHeight);
     });
 
-    // Parse incoming binary frames:
-    // [header_len(uint32)][header(JSON)][depth float32 (w*h)][rgb u8 (3*w*h)]
+    // ---------- Tween state (inertia smoothing) ----------
+    // lastPos, nextPos: Float32Array(N*3) world positions
+    // curPos is the attribute we render (mix of last/next)
+    let lastPos = null, nextPos = null, curPos = null;
+    let curCol = null;
+    let tweenT = 1;                 // 0..1
+    let targetTweenMs = 120;        // default smoothing window (ms), adapts to network cadence
+    let lastArrival = performance.now();
+
+    function ensureBuffers(N) {
+      const needAlloc = !geom.getAttribute('position') || geom.getAttribute('position').count !== N;
+      if (needAlloc) {
+        curPos = new Float32Array(N * 3);
+        curCol = new Float32Array(N * 3);
+        lastPos = new Float32Array(N * 3);
+        nextPos = new Float32Array(N * 3);
+        geom.setAttribute('position', new THREE.BufferAttribute(curPos, 3));
+        geom.setAttribute('color',    new THREE.BufferAttribute(curCol, 3));
+      } else {
+        curPos = geom.getAttribute('position').array;
+        curCol = geom.getAttribute('color').array;
+        if (!lastPos || lastPos.length !== curPos.length) lastPos = new Float32Array(curPos.length);
+        if (!nextPos || nextPos.length !== curPos.length) nextPos = new Float32Array(curPos.length);
+      }
+    }
+
+    // ---------- Parse incoming binary frames ----------
+    // [header_len(uint32)][header(JSON)][(pad 0..3 bytes)][depth float32 (w*h)][rgb u8 (3*w*h)]
     function parseFrame(buffer) {
       const dv = new DataView(buffer);
       const headerLen = dv.getUint32(0, true);
       let offset = 4;
+      if (headerLen === 0) return { hello: true };
+
       const headerStr = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen));
       offset += headerLen;
-      if (headerLen === 0) return { hello: true };
+
+      // align to 4 bytes for Float32Array safety
+      const misalign = offset & 3;
+      if (misalign) offset += (4 - misalign);
 
       const header = JSON.parse(headerStr);
       const N = header.w * header.h;
@@ -72,19 +103,9 @@
       return { header, depth, rgb };
     }
 
-    function updatePointCloud({ header, depth, rgb }) {
+    // ---------- Point-cloud unprojection into target buffer ----------
+    function unprojectInto(targetArray, colorArrayOrNull, header, depth, rgb) {
       const { w, h, fx, fy, cx, cy } = header;
-      // allocate once if size changed
-      const N = w * h;
-      if (!geom.attributes.position || geom.attributes.position.count !== N) {
-        geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
-        geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
-      }
-      const pos = geom.attributes.position.array;
-      const col = geom.attributes.color.array;
-
-      // Unproject each pixel center -> 3D (pinhole)
-      // X = (u - cx) / fx * Z ; Y = (v - cy) / fy * Z ; Z = depth
       let k = 0, c = 0;
       for (let v = 0; v < h; v++) {
         for (let u = 0; u < w; u++) {
@@ -93,62 +114,100 @@
           const X = (u - cx) / fx * Z;
           const Y = (v - cy) / fy * Z;
 
-          pos[k++] =  X;
-          pos[k++] = -Y;   // flip Y for a more natural orientation
-          pos[k++] = -Z;   // look into -Z
+          // world orientation
+          targetArray[k++] =  X;
+          targetArray[k++] = -Y;
+          targetArray[k++] = -Z;
 
-          const r = rgb[c++] / 255;
-          const g = rgb[c++] / 255;
-          const b = rgb[c++] / 255;
-          col[i*3    ] = r;
-          col[i*3 + 1] = g;
-          col[i*3 + 2] = b;
+          if (colorArrayOrNull) {
+            colorArrayOrNull[i*3    ] = rgb[c++] / 255;
+            colorArrayOrNull[i*3 + 1] = rgb[c++] / 255;
+            colorArrayOrNull[i*3 + 2] = rgb[c++] / 255;
+          } else {
+            c += 3;
+          }
         }
       }
-      geom.attributes.position.needsUpdate = true;
-      geom.attributes.color.needsUpdate = true;
-      geom.computeBoundingSphere();
     }
 
-    // Simple FPS/status
-    let lastTs = performance.now(), frames = 0;
+    // ---------- Network & tween handling ----------
     let statusText = "connecting…";
+
+    function onNewNetworkFrame(parsed) {
+      const { header, depth, rgb } = parsed;
+      const N = header.w * header.h;
+      ensureBuffers(N);
+
+      // next -> last
+      lastPos.set(nextPos);
+
+      // fill next with new positions; update colors once per frame
+      unprojectInto(nextPos, curCol, header, depth, rgb);
+      geom.getAttribute('color').needsUpdate = true;
+
+      // reset tween and adapt duration to inter-arrival time
+      const now = performance.now();
+      const inter = Math.min(300, Math.max(30, now - lastArrival));
+      lastArrival = now;
+      targetTweenMs = 0.8 * targetTweenMs + 0.2 * inter;
+      tweenT = 0;
+
+      statusText = `w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms`;
+    }
+
+    // ---------- Render: mix lastPos → nextPos over time ----------
+    let lastFrameT = performance.now();
+    function render() {
+      const t = performance.now();
+      const dt = t - lastFrameT; lastFrameT = t;
+
+      if (tweenT < 1 && curPos && nextPos && lastPos) {
+        const step = dt / Math.max(1, targetTweenMs);
+        tweenT = Math.min(1, tweenT + step);
+
+        // curPos = mix(lastPos, nextPos, tweenT)
+        const L = curPos.length;
+        const a = 1 - tweenT, b = tweenT;
+        for (let i = 0; i < L; i++) {
+          curPos[i] = a * lastPos[i] + b * nextPos[i];
+        }
+        geom.getAttribute('position').needsUpdate = true;
+        geom.computeBoundingSphere();
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ---------- Overlay FPS/status ----------
+    let lastTs = performance.now(), frames = 0;
     function tickOverlay() {
       const now = performance.now();
       frames++;
       if (now - lastTs >= 1000) {
-        overlay.textContent = statusText + ` | ${frames} fps`;
+        overlay.textContent = `${statusText} | ${frames} fps`;
         frames = 0;
         lastTs = now;
       }
       requestAnimationFrame(tickOverlay);
     }
-    tickOverlay();
 
-    // Connect to Python server
+    // ---------- WebSocket ----------
     const ws = new WebSocket("ws://localhost:8765");
     ws.binaryType = "arraybuffer";
 
-    ws.onopen = () => {
-      statusText = "connected";
-    };
-
+    ws.onopen = () => { statusText = "connected"; };
     ws.onmessage = (ev) => {
       const parsed = parseFrame(ev.data);
       if (parsed.hello) return;
-      updatePointCloud(parsed);
-      statusText = `w=${parsed.header.w} h=${parsed.header.h}`;
+      onNewNetworkFrame(parsed);
     };
+    ws.onclose = () => { statusText = "disconnected"; };
 
-    ws.onclose = () => {
-      statusText = "disconnected";
-    };
-
-    (function render() {
-      requestAnimationFrame(render);
-      controls.update();
-      renderer.render(scene, camera);
-    })();
+    // start loops
+    tickOverlay();
+    render();
   </script>
 </body>
 </html>
