@@ -1,0 +1,295 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Depth Point Cloud + Rain Collisions</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    #overlay { position:fixed; top:12px; left:12px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.4); padding:8px 10px; border-radius:8px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">connecting…</div>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    const overlay = document.getElementById("overlay");
+
+    // --- Scene ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // --- Live cloud (your original viewer with tweening) ---
+    const cloudMaterial = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
+    const cloudGeom = new THREE.BufferGeometry();
+    const cloudPoints = new THREE.Points(cloudGeom, cloudMaterial);
+    scene.add(cloudPoints);
+
+    // tween state
+    let lastPos=null, nextPos=null, curPos=null, curCol=null;
+    let tweenT = 1, targetTweenMs = 120, lastArrival = performance.now();
+
+    function ensureCloudBuffers(N){
+      const needAlloc = !cloudGeom.getAttribute('position') || cloudGeom.getAttribute('position').count !== N;
+      if (needAlloc){
+        curPos  = new Float32Array(N*3);
+        curCol  = new Float32Array(N*3);
+        lastPos = new Float32Array(N*3);
+        nextPos = new Float32Array(N*3);
+        cloudGeom.setAttribute('position', new THREE.BufferAttribute(curPos, 3));
+        cloudGeom.setAttribute('color',    new THREE.BufferAttribute(curCol, 3));
+      } else {
+        curPos = cloudGeom.getAttribute('position').array;
+        curCol = cloudGeom.getAttribute('color').array;
+        if (!lastPos || lastPos.length !== curPos.length) lastPos = new Float32Array(curPos.length);
+        if (!nextPos || nextPos.length !== curPos.length) nextPos = new Float32Array(curPos.length);
+      }
+    }
+
+    function parseFrame(buffer){
+      const dv = new DataView(buffer);
+      const headerLen = dv.getUint32(0, true);
+      let offset = 4;
+      if (headerLen === 0) return { hello:true };
+
+      const headerStr = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen));
+      offset += headerLen;
+
+      const mis = offset & 3; if (mis) offset += (4 - mis);
+
+      const header = JSON.parse(headerStr);
+      const N = header.w * header.h;
+
+      const depth = new Float32Array(buffer, offset, N);
+      offset += N * 4;
+
+      const rgb = new Uint8Array(buffer, offset, N * 3);
+      return { header, depth, rgb };
+    }
+
+    function unprojectInto(targetArray, colorArray, header, depth, rgb){
+      const { w,h, fx,fy, cx,cy } = header;
+      let k=0, c=0;
+      for (let v=0; v<h; v++){
+        for (let u=0; u<w; u++){
+          const i = v*w + u;
+          const Z = depth[i];
+          const X = (u - cx) / fx * Z;
+          const Y = (v - cy) / fy * Z;
+
+          targetArray[k++] =  X;
+          targetArray[k++] = -Y;
+          targetArray[k++] = -Z;
+
+          colorArray[i*3    ] = rgb[c++] / 255;
+          colorArray[i*3 + 1] = rgb[c++] / 255;
+          colorArray[i*3 + 2] = rgb[c++] / 255;
+        }
+      }
+    }
+
+    // --- Collision grid built from nextPos ---
+    const CELL = 0.03;              // ~3 cm voxel
+    const SAMPLE_STRIDE = 3;         // use every Nth point to fill grid
+    let occGrid = new Set();         // string keys "ix,iy,iz"
+    let cloudBounds = { center:new THREE.Vector3(0,0,-1.2), radius:0.8 };
+
+    function rebuildGridFromCloud(){
+      occGrid.clear();
+      if (!nextPos) return;
+      const L = nextPos.length/3;
+      let minx=Infinity,miny=Infinity,minz=Infinity, maxx=-Infinity,maxy=-Infinity,maxz=-Infinity;
+
+      for (let i=0; i<L; i+=SAMPLE_STRIDE){
+        const x = nextPos[3*i+0], y = nextPos[3*i+1], z = nextPos[3*i+2];
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+        const ix = Math.floor(x/CELL), iy = Math.floor(y/CELL), iz = Math.floor(z/CELL);
+        occGrid.add(ix+","+iy+","+iz);
+
+        if (x<minx) minx=x; if (y<miny) miny=y; if (z<minz) minz=z;
+        if (x>maxx) maxx=x; if (y>maxy) maxy=y; if (z>maxz) maxz=z;
+      }
+      // update bounds for rain spawn area
+      if (isFinite(minx)){
+        const cx=(minx+maxx)/2, cy=(miny+maxy)/2, cz=(minz+maxz)/2;
+        const rx=(maxx-minx)/2, ry=(maxy-miny)/2, rz=(maxz-minz)/2;
+        cloudBounds.center.set(cx,cy,cz);
+        cloudBounds.radius = Math.max(rx,ry,rz) || 0.8;
+      }
+    }
+
+
+    
+
+    // --- Rain system ---
+    const RAIN_COUNT = 1500;
+    const GRAVITY = 1.6;            // m/s downward
+    const HIT_FLASH_MS = 150;
+    const RAIN_SPREAD = 1.2;         // extra margin beyond cloud radius
+
+    const rainGeom = new THREE.BufferGeometry();
+    const rainPos = new Float32Array(RAIN_COUNT*3);
+    const rainCol = new Float32Array(RAIN_COUNT*3);
+    const rainVel = new Float32Array(RAIN_COUNT);       // downward speed multiplier
+    const rainHit = new Float32Array(RAIN_COUNT);       // ms remaining for flash
+
+    function respawnDrop(i){
+      const R = cloudBounds.radius || 0.8;
+      const c = cloudBounds.center;
+      // spawn above the cloud
+      const spread = R*RAIN_SPREAD;
+      const x = c.x + (Math.random()*2-1)*spread;
+      const z = c.z + (Math.random()*2-1)*spread;
+      const y = c.y + (R + 0.6 + Math.random()*0.4); // a bit above
+      rainPos[3*i+0]=x; rainPos[3*i+1]=y; rainPos[3*i+2]=z;
+      rainVel[i] = 0.8 + Math.random()*0.8;
+      rainHit[i] = 0;
+      // default blue-ish
+      rainCol[3*i+0]=0.5; rainCol[3*i+1]=0.7; rainCol[3*i+2]=1.0;
+    }
+
+    function initRain(){
+      for (let i=0;i<RAIN_COUNT;i++) respawnDrop(i);
+        rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
+      rainGeom.setAttribute('color',    new THREE.BufferAttribute(rainCol, 3));
+      const rainMat = new THREE.PointsMaterial({ size: 0.012, vertexColors: true, sizeAttenuation: true });
+      const rainPoints = new THREE.Points(rainGeom, rainMat);
+      scene.add(rainPoints);
+    }
+    initRain();
+
+    function stepRain(dt){
+      const R = (cloudBounds.radius||0.8) + 0.5;
+      const floorY = cloudBounds.center.y - R; // simple floor a bit under cloud
+
+      for (let i=0;i<RAIN_COUNT;i++){
+        // integrate
+        rainPos[3*i+1] -= GRAVITY * rainVel[i] * dt;
+
+        // collision via voxel grid
+        const x = rainPos[3*i+0], y = rainPos[3*i+1], z = rainPos[3*i+2];
+        const ix = Math.floor(x/CELL), iy = Math.floor(y/CELL), iz = Math.floor(z/CELL);
+        const key = ix+","+iy+","+iz;
+        if (occGrid.has(key) && rainHit[i] <= 0){
+          // flash red
+          rainHit[i] = HIT_FLASH_MS;
+        }
+
+        // color update (flash decay)
+        if (rainHit[i] > 0){
+          rainHit[i] -= dt*1000;
+          const t = Math.max(0, Math.min(1, rainHit[i]/HIT_FLASH_MS));
+          // lerp to red
+          rainCol[3*i+0] = 1.0 * t + 0.5*(1-t);
+          rainCol[3*i+1] = 0.1 * t + 0.7*(1-t);
+          rainCol[3*i+2] = 0.1 * t + 1.0*(1-t);
+        }
+
+        // recycle if below floor
+        if (y < floorY) respawnDrop(i);
+      }
+      rainGeom.getAttribute('position').needsUpdate = true;
+      rainGeom.getAttribute('color').needsUpdate    = true;
+    }
+
+    // --- Network / tween / grid update ---
+    let statusText = "connecting…";
+
+    function onNewNetworkFrame(parsed){
+      const { header, depth, rgb } = parsed;
+      const N = header.w * header.h;
+      ensureCloudBuffers(N);
+
+      // next -> last; fill next
+      lastPos.set(nextPos);
+      unprojectInto(nextPos, curCol, header, depth, rgb);
+      cloudGeom.getAttribute('color').needsUpdate = true;
+
+      // rebuild occupancy grid from the *new* nextPos
+      rebuildGridFromCloud();
+
+      // adapt tween
+      const now = performance.now();
+      const inter = Math.min(300, Math.max(30, now - lastArrival));
+      lastArrival = now;
+      targetTweenMs = 0.8*targetTweenMs + 0.2*inter;
+      tweenT = 0;
+
+      statusText = `w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms | rain=${RAIN_COUNT}`;
+    }
+
+    // --- Render loop ---
+    let lastFrameT = performance.now();
+    function render(){
+      const t = performance.now();
+      const dt = (t - lastFrameT) / 1000; // seconds
+      lastFrameT = t;
+
+      // tween mix lastPos -> nextPos
+      if (tweenT < 1 && curPos && nextPos && lastPos){
+        const step = (dt*1000) / Math.max(1, targetTweenMs);
+        tweenT = Math.min(1, tweenT + step);
+        const L = curPos.length;
+        const a = 1 - tweenT, b = tweenT;
+        for (let i=0; i<L; i++) curPos[i] = a*lastPos[i] + b*nextPos[i];
+          cloudGeom.getAttribute('position').needsUpdate = true;
+        cloudGeom.computeBoundingSphere();
+      }
+
+      // step rain & collisions
+      stepRain(dt);
+
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // --- Overlay FPS/status ---
+    let lastTs = performance.now(), frames = 0;
+    function tickOverlay(){
+      const now = performance.now();
+      frames++;
+      if (now - lastTs >= 1000){
+        overlay.textContent = `${statusText} | ${frames} fps`;
+        frames = 0; lastTs = now;
+      }
+      requestAnimationFrame(tickOverlay);
+    }
+
+    // --- WebSocket ---
+    const ws = new WebSocket("ws://localhost:8765");
+    ws.binaryType = "arraybuffer";
+    ws.onopen = ()=>{ statusText = "connected"; };
+    ws.onmessage = (ev)=>{
+      const parsed = parseFrame(ev.data);
+      if (!parsed.hello) onNewNetworkFrame(parsed);
+    };
+    ws.onclose = ()=>{ statusText = "disconnected"; };
+
+    // start
+    tickOverlay();
+    render();
+  </script>
+</body>
+</html>

@@ -12,207 +12,44 @@
     {
       "imports": {
         "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/",
-        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.18/dist/lil-gui.esm.min.js"
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
       }
     }
   </script>
 </head>
 <body>
   <div id="overlay">connecting…</div>
-
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
     import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
-    import { GUI } from "lil-gui";
-
     const overlay = document.getElementById("overlay");
-
+    // ---- NEW: status/pause state ----
     let statusText = "connecting…";
     let paused = false;
     let lastHeader = null;
-
     // --- Scene ---
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x000000);
-
     const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
     camera.position.set(0, 0, 2);
-
     const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(devicePixelRatio);
     renderer.setSize(innerWidth, innerHeight);
     document.body.appendChild(renderer.domElement);
-
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-
-    // --- Filters & GUI ---
-    const FILTERS = { None:0, Monochrome:1, Invert:2, "Invert+Mono":3, "Tint Red":4, "Red→Yellow":5 };
-
-    const params = {
-      // color
-      filter: FILTERS.None,
-      hue: 0,                // degrees
-      tintAmount: 0.55,      // only for Tint Red
-      brightness: 1.0,
-      contrast: 1.0,         // 1=no change
-      clamp: true,
-      bwEnabled: false,
-      bwThreshold: 0.5,      // 0..1 on luminance
-
-      // points
-      pointSize: 0.010,      // THREE.PointsMaterial.size
-      pointShape: "square",  // square | circle | cross
-      shapeFeather: 1.25,    // edge softness for circle/cross
-      crossThickness: 0.22,  // relative bar thickness (0..1)
-
-      // rain
-      rainSpeed: 1.0         // multiplies gravity & spawn speeds
-    };
-
-    const gui = new GUI();
-    const gColor = gui.addFolder("Color");
-    gColor.add(params, "filter", FILTERS).name("Mode").onChange(reapplyFilter);
-    gColor.add(params, "hue", 0, 360, 1).name("Hue Rotation").onChange(reapplyFilter);
-    const tintCtrl = gColor.add(params, "tintAmount", 0, 1, 0.01).name("Tint Amount").onChange(reapplyFilter);
-    gColor.add(params, "brightness", 0.25, 2.0, 0.01).name("Brightness").onChange(reapplyFilter);
-    gColor.add(params, "contrast", 0.2, 3.0, 0.01).name("Contrast").onChange(reapplyFilter);
-    gColor.add(params, "clamp").name("Clamp 0..1").onChange(reapplyFilter);
-    gColor.add(params, "bwEnabled").name("B&W Threshold").onChange(reapplyFilter);
-    gColor.add(params, "bwThreshold", 0, 1, 0.01).name("Threshold").onChange(reapplyFilter);
-    gColor.open();
-    gui.onChange(() => { params.filter === FILTERS["Tint Red"] ? tintCtrl.enable() : tintCtrl.disable(); });
-
-    const gPoints = gui.addFolder("Points");
-    gPoints.add(params, "pointSize", 0.002, 0.05, 0.001).name("Size").onChange(() => {
-      cloudMaterial.size = params.pointSize;
-      if (paused) renderer.render(scene, camera);
-    });
-    gPoints.add(params, "pointShape", ["square","circle","cross"]).name("Shape").onChange(setPointShape);
-    gPoints.add(params, "shapeFeather", 0.0, 4.0, 0.01).name("Edge Softness").onChange(setPointShape);
-    gPoints.add(params, "crossThickness", 0.05, 0.5, 0.005).name("Cross Thickness").onChange(setPointShape);
-    gPoints.open();
-
-    const gRain = gui.addFolder("Rain");
-    gRain.add(params, "rainSpeed", 0.2, 3.0, 0.01).name("Speed");
-    gRain.open();
-
-    // --- Live cloud (Points) ---
-    const cloudMaterial = new THREE.PointsMaterial({
-      size: params.pointSize,
-      vertexColors: true,
-      sizeAttenuation: true
-    });
+    // --- Live cloud (with tweening) ---
+    const cloudMaterial = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
     const cloudGeom = new THREE.BufferGeometry();
-    const cloudPoints = new THREE.Points(cloudGeom, cloudMaterial);
-    scene.add(cloudPoints);
-
-    let lastPos=null, nextPos=null, curPos=null, curCol=null, baseCol=null;
+    scene.add(new THREE.Points(cloudGeom, cloudMaterial));
+    let lastPos=null, nextPos=null, curPos=null, curCol=null;
     let tweenT = 1, targetTweenMs = 120, lastArrival = performance.now();
-
-    // Procedural sprite textures for shapes
-    let shapeTexture = null;
-
-    function makeCircleTexture(size=64, feather=1.5){
-      const cnv = document.createElement('canvas');
-      cnv.width = cnv.height = size;
-      const ctx = cnv.getContext('2d');
-      const cx = size/2, cy = size/2, r = size/2 - 1;
-      const img = ctx.createImageData(size, size);
-      for (let y=0; y<size; y++){
-        for (let x=0; x<size; x++){
-          const dx = x - cx + 0.5, dy = y - cy + 0.5;
-          const d = Math.sqrt(dx*dx + dy*dy);
-          let a = 1.0 - (d - (r-1)) * feather / 3.0; // soft edge
-          a = Math.max(0, Math.min(1, a));
-          const i = (y*size + x)*4;
-          img.data[i+0] = 255;
-          img.data[i+1] = 255;
-          img.data[i+2] = 255;
-          img.data[i+3] = Math.round(a*255);
-        }
-      }
-      ctx.putImageData(img, 0, 0);
-      const tex = new THREE.CanvasTexture(cnv);
-      tex.minFilter = THREE.LinearFilter;
-      tex.magFilter = THREE.LinearFilter;
-      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-      return tex;
-    }
-
-    function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
-      const cnv = document.createElement('canvas');
-      cnv.width = cnv.height = size;
-      const ctx = cnv.getContext('2d');
-      const img = ctx.createImageData(size, size);
-      const half = size/2;
-      const halfBar = (thickness * size) * 0.5;
-
-      function smoothStep(edge0, edge1, x){
-        const t = Math.max(0, Math.min(1, (x-edge0)/(edge1-edge0)));
-        return t*t*(3-2*t);
-      }
-
-      for (let y=0; y<size; y++){
-        for (let x=0; x<size; x++){
-          const dx = x + 0.5 - half, dy = y + 0.5 - half;
-          // distance to vertical bar and horizontal bar
-          const dv = Math.abs(dx) - halfBar;
-          const dh = Math.abs(dy) - halfBar;
-          // feathered alpha for each bar
-          const av = 1.0 - smoothStep(0, feather, Math.max(0, dv));
-          const ah = 1.0 - smoothStep(0, feather, Math.max(0, dh));
-          // union of bars
-          let a = Math.max(av, ah);
-          a = Math.max(0, Math.min(1, a));
-          const i = (y*size + x)*4;
-          img.data[i+0] = 255;
-          img.data[i+1] = 255;
-          img.data[i+2] = 255;
-          img.data[i+3] = Math.round(a*255);
-        }
-      }
-      ctx.putImageData(img, 0, 0);
-      const tex = new THREE.CanvasTexture(cnv);
-      tex.minFilter = THREE.LinearFilter;
-      tex.magFilter = THREE.LinearFilter;
-      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-      return tex;
-    }
-
-    function setPointShape(){
-      // dispose old texture to avoid leaks
-      if (shapeTexture) { shapeTexture.dispose(); shapeTexture = null; }
-
-      if (params.pointShape === "square"){
-        cloudMaterial.map = null;
-        cloudMaterial.alphaTest = 0.0;
-        cloudMaterial.transparent = false;
-      } else if (params.pointShape === "circle"){
-        shapeTexture = makeCircleTexture(64, params.shapeFeather);
-        cloudMaterial.map = shapeTexture;
-        cloudMaterial.alphaTest = 0.5;
-        cloudMaterial.transparent = true;
-      } else if (params.pointShape === "cross"){
-        shapeTexture = makeCrossTexture(64, params.crossThickness, params.shapeFeather);
-        cloudMaterial.map = shapeTexture;
-        cloudMaterial.alphaTest = 0.5;
-        cloudMaterial.transparent = true;
-      }
-      cloudMaterial.needsUpdate = true;
-      if (paused) renderer.render(scene, camera);
-    }
-    // initialize shape once
-    setPointShape();
-
     function ensureCloudBuffers(N){
       const needAlloc = !cloudGeom.getAttribute('position') || cloudGeom.getAttribute('position').count !== N;
       if (needAlloc){
         curPos  = new Float32Array(N*3);
         curCol  = new Float32Array(N*3);
-        baseCol = new Float32Array(N*3);
         lastPos = new Float32Array(N*3);
         nextPos = new Float32Array(N*3);
         cloudGeom.setAttribute('position', new THREE.BufferAttribute(curPos, 3));
@@ -220,12 +57,10 @@
       } else {
         curPos = cloudGeom.getAttribute('position').array;
         curCol = cloudGeom.getAttribute('color').array;
-        if (!baseCol || baseCol.length !== curCol.length) baseCol = new Float32Array(curCol.length);
         if (!lastPos || lastPos.length !== curPos.length) lastPos = new Float32Array(curPos.length);
         if (!nextPos || nextPos.length !== curPos.length) nextPos = new Float32Array(curPos.length);
       }
     }
-
     function parseFrame(buffer){
       const dv = new DataView(buffer);
       const headerLen = dv.getUint32(0, true);
@@ -241,7 +76,6 @@
       const rgb = new Uint8Array(buffer, offset, N * 3);
       return { header, depth, rgb };
     }
-
     function unprojectInto(targetArray, colorArray, header, depth, rgb){
       const { w,h, fx,fy, cx,cy } = header;
       let k=0, c=0;
@@ -251,130 +85,36 @@
           const Z = depth[i];
           const X = (u - cx) / fx * Z;
           const Y = (v - cy) / fy * Z;
-
           targetArray[k++] =  X;
           targetArray[k++] = -Y;
           targetArray[k++] = -Z;
-
-          baseCol[i*3    ] = rgb[c++] / 255;
-          baseCol[i*3 + 1] = rgb[c++] / 255;
-          baseCol[i*3 + 2] = rgb[c++] / 255;
+          colorArray[i*3    ] = rgb[c++] / 255;
+          colorArray[i*3 + 1] = rgb[c++] / 255;
+          colorArray[i*3 + 2] = rgb[c++] / 255;
         }
       }
-      applyFilter(curCol, baseCol);
     }
-
-    // --- Color pipeline ---
-    function luma(r,g,b){ return 0.2126*r + 0.7152*g + 0.0722*b; }
-
-    function rotateHue(r,g,b, deg){
-      const a = deg * Math.PI / 180.0;
-      const cosA = Math.cos(a), sinA = Math.sin(a);
-      const m = [
-        0.299 + 0.701*cosA + 0.168*sinA, 0.587 - 0.587*cosA + 0.330*sinA, 0.114 - 0.114*cosA - 0.497*sinA,
-        0.299 - 0.299*cosA - 0.328*sinA, 0.587 + 0.413*cosA + 0.035*sinA, 0.114 - 0.114*cosA + 0.292*sinA,
-        0.299 - 0.300*cosA + 1.250*sinA, 0.587 - 0.588*cosA - 1.050*sinA, 0.114 + 0.886*cosA - 0.203*sinA
-      ];
-      return [
-        m[0]*r + m[1]*g + m[2]*b,
-        m[3]*r + m[4]*g + m[5]*b,
-        m[6]*r + m[7]*g + m[8]*b
-      ];
-    }
-
-    function applyFilter(dst, src){
-      const mode = params.filter;
-      const tint = params.tintAmount;
-      const gain = params.brightness;
-      const ctr = params.contrast; // contrast factor
-      const doClamp = params.clamp;
-      const doBW = params.bwEnabled;
-      const thr = params.bwThreshold;
-      const hueDeg = params.hue|0;
-
-      for (let i=0; i<src.length; i+=3){
-        let r = src[i], g = src[i+1], b = src[i+2];
-
-        // base modes
-        if (mode === FILTERS.Monochrome){
-          const y = luma(r,g,b); r=g=b=y;
-        } else if (mode === FILTERS.Invert){
-          r = 1-r; g = 1-g; b = 1-b;
-        } else if (mode === FILTERS["Invert+Mono"]){
-          const y = 1 - luma(r,g,b); r=g=b=y;
-        } else if (mode === FILTERS["Tint Red"]){
-          g *= (1.0 - 0.55*tint);
-          b *= (1.0 - 0.55*tint);
-        } else if (mode === FILTERS["Red→Yellow"]){
-          const t = luma(r,g,b);
-          r = 1.0; g = t; b = 0.0;
-        }
-
-        // hue rotation
-        if (hueDeg !== 0){
-          const v = rotateHue(r,g,b, hueDeg);
-          r = v[0]; g = v[1]; b = v[2];
-        }
-
-        // brightness
-        r *= gain; g *= gain; b *= gain;
-
-        // contrast (pivot at 0.5)
-        r = (r - 0.5)*ctr + 0.5;
-        g = (g - 0.5)*ctr + 0.5;
-        b = (b - 0.5)*ctr + 0.5;
-
-        // optional B&W threshold (on luminance after contrast)
-        if (doBW){
-          const y = luma(r,g,b);
-          const bw = (y >= thr) ? 1.0 : 0.0;
-          r = g = b = bw;
-        }
-
-        if (doClamp){
-          r = Math.min(1, Math.max(0, r));
-          g = Math.min(1, Math.max(0, g));
-          b = Math.min(1, Math.max(0, b));
-        }
-
-        dst[i]=r; dst[i+1]=g; dst[i+2]=b;
-      }
-    }
-
-    function reapplyFilter(){
-      if (!baseCol || !curCol) return;
-      applyFilter(curCol, baseCol);
-      const attr = cloudGeom.getAttribute('color');
-      if (attr) attr.needsUpdate = true;
-      if (paused) renderer.render(scene, camera);
-    }
-
-    // --- Collision grid from nextPos ---
+    // --- Collision grid built from nextPos ---
     const CELL = 0.03;
     const SAMPLE_STRIDE = 3;
     const COLLISION_RADIUS = 0.045;
     let occGrid = new Map();
     let cloudBounds = { center:new THREE.Vector3(0,0,-1.2), radius:0.8 };
     function keyFrom(ix,iy,iz){ return ix + "," + iy + "," + iz; }
-
     function rebuildGridFromCloud(){
       occGrid.clear();
       if (!nextPos) return;
       const L = nextPos.length / 3;
-
       let minx=Infinity,miny=Infinity,minz=Infinity, maxx=-Infinity,maxy=-Infinity,maxz=-Infinity;
-
       for (let i=0; i<L; i += SAMPLE_STRIDE){
         const x = nextPos[3*i+0], y = nextPos[3*i+1], z = nextPos[3*i+2];
         if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
         const ix = Math.floor(x/CELL), iy = Math.floor(y/CELL), iz = Math.floor(z/CELL);
         const k = keyFrom(ix,iy,iz);
         if (!occGrid.has(k)) occGrid.set(k, {x,y,z});
-
         if (x<minx) minx=x; if (y<miny) miny=y; if (z<minz) minz=z;
         if (x>maxx) maxx=x; if (y>maxy) maxy=y; if (z>maxz) maxz=z;
       }
-
       if (isFinite(minx)){
         const cx=(minx+maxx)/2, cy=(miny+maxy)/2, cz=(minz+maxz)/2;
         const rx=(maxx-minx)/2, ry=(maxy-miny)/2, rz=(maxz-minz)/2;
@@ -382,10 +122,8 @@
         cloudBounds.radius = Math.max(rx,ry,rz) || 0.8;
       }
     }
-
     const NEIGH = [];
     for (let dz=-1; dz<=1; dz++) for (let dy=-1; dy<=1; dy++) for (let dx=-1; dx<=1; dx++) NEIGH.push([dx,dy,dz]);
-
       function collidesWithCloud(x,y,z){
         const ix = Math.floor(x/CELL), iy = Math.floor(y/CELL), iz = Math.floor(z/CELL);
         const r2 = COLLISION_RADIUS*COLLISION_RADIUS;
@@ -397,17 +135,14 @@
         }
         return false;
       }
-
-    // --- Rain system ---
+    // --- Rain system with multiple collision behaviours ---
       const RAIN_COUNT = 1200;
-      const GRAVITY_BASE = 1.6;
+      const GRAVITY = 1.6;
       const HIT_FLASH_MS = 180;
       const STICK_MS = 700;
       const RAIN_SPREAD = 1.2;
-
       const BEHAVIOUR = { STICK:1, FLY_UP:2, RADIAL:3, RANDOM:4 };
       let behaviour = BEHAVIOUR.STICK;
-
       const rainGeom = new THREE.BufferGeometry();
       const rainPos = new Float32Array(RAIN_COUNT*3);
       const rainCol = new Float32Array(RAIN_COUNT*3);
@@ -417,7 +152,6 @@
       const rainFlash = new Float32Array(RAIN_COUNT);
       const rainStick = new Float32Array(RAIN_COUNT);
       const rainBounce = new Float32Array(RAIN_COUNT);
-
       function respawnDrop(i){
         const R = cloudBounds.radius || 0.8;
         const c = cloudBounds.center;
@@ -425,19 +159,14 @@
         rainPos[3*i+0] = c.x + (Math.random()*2-1)*spread;
         rainPos[3*i+2] = c.z + (Math.random()*2-1)*spread;
         rainPos[3*i+1] = c.y + (R + 0.6 + Math.random()*0.4);
-
-        const speedMul = params.rainSpeed;
         rainVX[i] = 0;
-        rainVY[i] = -(0.6 + Math.random()*0.4) * speedMul;
+        rainVY[i] = -(0.6 + Math.random()*0.4);
         rainVZ[i] = 0;
-
         rainFlash[i] = 0;
         rainStick[i] = 0;
         rainBounce[i] = 0;
-
         rainCol[3*i+0] = 0.5; rainCol[3*i+1] = 0.7; rainCol[3*i+2] = 1.0;
       }
-
       (function initRain(){
         for (let i=0;i<RAIN_COUNT;i++) respawnDrop(i);
           rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
@@ -445,60 +174,50 @@
         const rainMat = new THREE.PointsMaterial({ size: 0.012, vertexColors: true, sizeAttenuation: true });
         scene.add(new THREE.Points(rainGeom, rainMat));
       })();
-
       function impulseOnHit(i){
         rainFlash[i] = HIT_FLASH_MS;
         const x = rainPos[3*i+0], y = rainPos[3*i+1], z = rainPos[3*i+2];
         const c = cloudBounds.center;
-        const speedMul = params.rainSpeed;
-
         if (behaviour === BEHAVIOUR.STICK){
           rainStick[i] = STICK_MS;
           rainVX[i] = rainVY[i] = rainVZ[i] = 0;
         } else if (behaviour === BEHAVIOUR.FLY_UP){
-          rainVY[i] = (3.2 + Math.random()*0.8) * speedMul;
-          rainVX[i] = (Math.random()*2-1) * 0.3 * speedMul;
-          rainVZ[i] = (Math.random()*2-1) * 0.3 * speedMul;
+          rainVY[i] = 3.2 + Math.random()*0.8;
+          rainVX[i] = (Math.random()*2-1) * 0.3;
+          rainVZ[i] = (Math.random()*2-1) * 0.3;
           rainBounce[i] = 450;
         } else if (behaviour === BEHAVIOUR.RADIAL){
           let dx = x - c.x, dy = y - c.y, dz = z - c.z;
           const len = Math.hypot(dx,dy,dz) || 1; dx/=len; dy/=len; dz/=len;
-          const speed = (2.4 + Math.random()*0.8) * speedMul;
+          const speed = 2.4 + Math.random()*0.8;
           rainVX[i] = dx * speed; rainVY[i] = dy * speed; rainVZ[i] = dz * speed;
           rainBounce[i] = 600;
         } else if (behaviour === BEHAVIOUR.RANDOM){
           let dx = Math.random()*2-1, dy = Math.random()*2-1, dz = Math.random()*2-1;
           const len = Math.hypot(dx,dy,dz) || 1; dx/=len; dy/=len; dz/=len;
-          const speed = (2.2 + Math.random()*1.2) * speedMul;
+          const speed = 2.2 + Math.random()*1.2;
           rainVX[i] = dx * speed; rainVY[i] = dy * speed; rainVZ[i] = dz * speed;
           rainBounce[i] = 500;
         }
       }
-
       function stepRain(dt){
         const R = (cloudBounds.radius||0.8) + 0.5;
         const floorY = cloudBounds.center.y - R;
-        const grav = GRAVITY_BASE * params.rainSpeed;
-
         for (let i=0;i<RAIN_COUNT;i++){
           const base = 3*i;
-
           if (rainStick[i] > 0){
             rainStick[i] -= dt*1000;
             rainFlash[i] = Math.max(rainFlash[i], 40);
           } else {
-            let g = grav;
+            let g = GRAVITY;
             if (rainBounce[i] > 0) { g *= 0.25; rainBounce[i] -= dt*1000; }
             rainVY[i] -= g * dt;
-
             rainPos[base+0] += rainVX[i] * dt;
             rainPos[base+1] += rainVY[i] * dt;
             rainPos[base+2] += rainVZ[i] * dt;
-
             const x = rainPos[base+0], y = rainPos[base+1], z = rainPos[base+2];
             if (collidesWithCloud(x,y,z)) impulseOnHit(i);
           }
-
           if (rainFlash[i] > 0){
             rainFlash[i] -= dt*1000;
             const t = Math.max(0, Math.min(1, rainFlash[i]/HIT_FLASH_MS));
@@ -508,7 +227,6 @@
           } else if (rainStick[i] <= 0){
             rainCol[base+0] = 0.5; rainCol[base+1] = 0.7; rainCol[base+2] = 1.0;
           }
-
           const c = cloudBounds.center;
           const tooFar = Math.hypot(rainPos[base+0]-c.x, rainPos[base+1]-c.y, rainPos[base+2]-c.z) > (cloudBounds.radius+2.5);
           if ((rainStick[i] <= 0 && rainPos[base+1] < floorY) || tooFar){
@@ -518,36 +236,30 @@
         rainGeom.getAttribute('position').needsUpdate = true;
         rainGeom.getAttribute('color').needsUpdate    = true;
       }
-
     // --- Network / tween / grid update ---
       function onNewNetworkFrame(parsed){
         const { header, depth, rgb } = parsed;
         const N = header.w * header.h;
         ensureCloudBuffers(N);
-
         lastPos.set(nextPos);
         unprojectInto(nextPos, curCol, header, depth, rgb);
         cloudGeom.getAttribute('color').needsUpdate = true;
-
+      // ---- NEW: store header for exporter ----
         lastHeader = header;
         rebuildGridFromCloud();
-
         const now = performance.now();
         const inter = Math.min(300, Math.max(30, now - lastArrival));
         lastArrival = now;
         targetTweenMs = 0.8*targetTweenMs + 0.2*inter;
         tweenT = 0;
-
         statusText = `w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms | rain=${RAIN_COUNT} | mode=${behaviour}`;
       }
-
-    // --- Controls / Export ---
+    // --- Controls: Pause (P), Save PNG (S), Fullscreen (F), Modes (1–4) & Export (G/Shift+G) ---
       function togglePause(){
         paused = !paused;
         statusText = (paused ? "[PAUSED] " : "") + statusText;
         if (paused) renderer.render(scene, camera);
       }
-
       function savePNG(){
         try{
           const url = renderer.domElement.toDataURL("image/png");
@@ -560,7 +272,6 @@
           a.click(); a.remove();
         } catch(e){ console.warn("PNG save failed:", e); }
       }
-
       async function toggleFullscreen(){
         try{
           if (!document.fullscreenElement) {
@@ -570,12 +281,11 @@
           }
         } catch(e){ console.warn("Fullscreen toggle failed:", e); }
       }
-
       function setBehaviour(n){
         behaviour = n;
         statusText = `mode=${n} (1=stick, 2=fly-up, 3=radial, 4=random)`;
       }
-
+// ---- glTF/GLB exporter ----
       function saveBlob(blob, filename) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -584,6 +294,7 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
       function saveArrayBuffer(arrayBuffer, filename) {
+  // keep for callers that already have ArrayBuffer
         saveBlob(new Blob([arrayBuffer], { type: "model/gltf-binary" }), filename);
       }
       function timestamp() {
@@ -591,20 +302,17 @@
         const pad = n => String(n).padStart(2, "0");
         return `${ts.getFullYear()}-${pad(ts.getMonth()+1)}-${pad(ts.getDate())}_${pad(ts.getHours())}-${pad(ts.getMinutes())}-${pad(ts.getSeconds())}`;
       }
-
+// Build a triangle mesh from the depth grid (downsampled)
       function buildMeshFromGrid(curPos, curCol, w, h, exportStride = 2, maxEdge = 0.08) {
         if (!curPos || !curCol || !w || !h) return null;
         const W = w, H = h, s = Math.max(1, exportStride);
         const nx = Math.floor((W - 1) / s) + 1;
         const ny = Math.floor((H - 1) / s) + 1;
-
         const positions = [];
         const colors = [];
         const indexMap = new Int32Array(nx * ny).fill(-1);
-
         const idxGrid = (yy, xx) => (yy * W + xx);
         const idxMap  = (j, i) => (j * nx + i);
-
         let vcount = 0;
         for (let j = 0, y = 0; j < ny; j++, y += s) {
           if (y >= H) y = H - 1;
@@ -621,28 +329,23 @@
             indexMap[idxMap(j,i)] = vcount++;
           }
         }
-
         const vIdx   = (j,i) => indexMap[idxMap(j,i)];
         const dist2  = (ax,ay,az, bx,by,bz) => {
           const dx=ax-bx, dy=ay-by, dz=az-bz; return dx*dx+dy*dy+dz*dz;
         };
         const maxEdge2 = maxEdge * maxEdge;
         const indices = [];
-
         for (let j = 0; j < ny - 1; j++) {
           for (let i = 0; i < nx - 1; i++) {
             const i00 = vIdx(j,i),   i10 = vIdx(j,i+1);
             const i01 = vIdx(j+1,i), i11 = vIdx(j+1,i+1);
             if (i00 < 0 || i10 < 0 || i01 < 0 || i11 < 0) continue;
-
             const a0 = i00*3, b0 = i10*3, c0 = i01*3, d0 = i11*3;
-
             const okA =
             dist2(positions[a0],positions[a0+1],positions[a0+2], positions[b0],positions[b0+1],positions[b0+2]) <= maxEdge2 &&
             dist2(positions[a0],positions[a0+1],positions[a0+2], positions[c0],positions[c0+1],positions[c0+2]) <= maxEdge2 &&
             dist2(positions[b0],positions[b0+1],positions[b0+2], positions[c0],positions[c0+1],positions[c0+2]) <= maxEdge2;
             if (okA) indices.push(i00, i10, i01);
-
             const okB =
             dist2(positions[b0],positions[b0+1],positions[b0+2], positions[d0],positions[d0+1],positions[d0+2]) <= maxEdge2 &&
             dist2(positions[b0],positions[b0+1],positions[b0+2], positions[c0],positions[c0+1],positions[c0+2]) <= maxEdge2 &&
@@ -650,53 +353,58 @@
             if (okB) indices.push(i10, i11, i01);
           }
         }
-
         if (positions.length === 0 || indices.length === 0) return null;
-
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
         geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors, 3));
         geo.setIndex(indices);
         geo.computeVertexNormals();
-
         const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0 });
         const mesh = new THREE.Mesh(geo, mat);
         mesh.name = "PointCloudSurface";
         return mesh;
       }
-
+// Fallback: export the live Points cloud as-is
       function buildPointsNodeFromCloud() {
         if (!cloudGeom || !cloudGeom.attributes?.position) return null;
-        const mat = new THREE.PointsMaterial({ size: params.pointSize, vertexColors: true, sizeAttenuation: true });
+        const mat = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
         const pts = new THREE.Points(cloudGeom.clone(), mat);
         pts.name = "PointCloudPoints";
         return pts;
       }
-
       function exportGLB({ exportStride = 2, maxEdge = 0.08 } = {}) {
-        if (!lastHeader || !curPos || !curCol) { console.warn("No cloud to export yet."); return; }
+        if (!lastHeader || !curPos || !curCol) {
+          console.warn("No cloud to export yet.");
+          return;
+        }
         const { w, h } = lastHeader;
         const mesh = buildMeshFromGrid(curPos, curCol, w, h, exportStride, maxEdge);
         const node = mesh || buildPointsNodeFromCloud();
         if (!node) { console.warn("Nothing valid to export."); return; }
-
         const exporter = new GLTFExporter();
         const options = { binary: true, embedImages: true, onlyVisible: true, includeCustomExtensions: true };
-        exporter.parse(node, (result) => {
-          const tag = Object.prototype.toString.call(result);
-          if (tag === "[object ArrayBuffer]") {
-            saveArrayBuffer(result, `pointcloud_${timestamp()}.glb`);
-          } else if (tag === "[object Blob]") {
-            saveBlob(result, `pointcloud_${timestamp()}.glb`);
-          } else {
-            console.warn("[export] Unexpected result type:", tag, result);
-          }
-          if (mesh) { mesh.geometry.dispose(); mesh.material.dispose(); }
-        }, options);
+        exporter.parse(node, async (result) => {
+            const tag = Object.prototype.toString.call(result); // [object ArrayBuffer] or [object Blob]
+            if (tag === "[object ArrayBuffer]") {
+              const bytes = result.byteLength;
+              console.log(`[export] GLB size: ${bytes} bytes`);
+              saveArrayBuffer(result, `pointcloud_${timestamp()}.glb`);
+            } else if (tag === "[object Blob]") {
+              const bytes = result.size;
+              console.log(`[export] GLB Blob size: ${bytes} bytes`);
+              // save directly; no need to re-wrap
+              saveBlob(result, `pointcloud_${timestamp()}.glb`);
+            } else {
+              console.warn("[export] Unexpected result type:", tag, result);
+            }
+            if (mesh) { mesh.geometry.dispose(); mesh.material.dispose(); }
+          }, options);
       }
-
       function exportGLTF_JSON({ exportStride = 2, maxEdge = 0.08 } = {}) {
-        if (!lastHeader || !curPos || !curCol) { console.warn("No cloud to export yet."); return; }
+        if (!lastHeader || !curPos || !curCol) {
+          console.warn("No cloud to export yet.");
+          return;
+        }
         const { w, h } = lastHeader;
         const mesh = buildMeshFromGrid(curPos, curCol, w, h, exportStride, maxEdge) || buildPointsNodeFromCloud();
         if (!mesh) { console.warn("Nothing valid to export."); return; }
@@ -711,7 +419,6 @@
           setTimeout(() => URL.revokeObjectURL(url), 1000);
         }, { binary: false, embedImages: true, onlyVisible: true, includeCustomExtensions: true });
       }
-
     // --- Keys ---
       window.addEventListener("keydown", (e)=>{
         const k = e.key.toLowerCase();
@@ -724,20 +431,12 @@
         else if (k === "4") setBehaviour(4);
         else if (k === "g" && !e.shiftKey) exportGLB({ exportStride: 2, maxEdge: 0.08 });
         else if (k === "g" &&  e.shiftKey) exportGLTF_JSON({ exportStride: 2, maxEdge: 0.08 });
-        else if (k === "t") {
-          const values = Object.values(FILTERS);
-          const idx = values.indexOf(params.filter);
-          params.filter = values[(idx + 1) % values.length];
-          reapplyFilter();
-        }
       });
-
     // --- Render loop ---
       let lastFrameT = performance.now();
       function render(){
         const t = performance.now();
         const dt = (t - lastFrameT) / 1000; lastFrameT = t;
-
         if (!paused){
           if (tweenT < 1 && curPos && nextPos && lastPos){
             const step = (dt*1000) / Math.max(1, targetTweenMs);
@@ -753,8 +452,7 @@
         }
         requestAnimationFrame(render);
       }
-
-    // --- Overlay ---
+    // --- Overlay FPS/status ---
       let lastTs = performance.now(), frames = 0;
       function tickOverlay(){
         const now = performance.now();
@@ -766,7 +464,6 @@
       }
       requestAnimationFrame(tickOverlay);
     }
-
     // --- WebSocket ---
     const ws = new WebSocket("ws://localhost:8765");
     ws.binaryType = "arraybuffer";
@@ -776,11 +473,9 @@
       if (!parsed.hello) onNewNetworkFrame(parsed);
     };
     ws.onclose = ()=>{ statusText = "disconnected"; };
-
     // start
     tickOverlay();
     render();
-
     // resize
     window.addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;

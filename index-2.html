@@ -1,0 +1,213 @@
+<!-- client/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Depth Point Cloud</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    #overlay { position:fixed; top:12px; left:12px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.4); padding:8px 10px; border-radius:8px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">connecting…</div>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    const overlay = document.getElementById("overlay");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    const material = new THREE.PointsMaterial({ size: 0.01, vertexColors: true, sizeAttenuation: true });
+    let geom = new THREE.BufferGeometry();
+    let points = new THREE.Points(geom, material);
+    scene.add(points);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // ---------- Tween state (inertia smoothing) ----------
+    // lastPos, nextPos: Float32Array(N*3) world positions
+    // curPos is the attribute we render (mix of last/next)
+    let lastPos = null, nextPos = null, curPos = null;
+    let curCol = null;
+    let tweenT = 1;                 // 0..1
+    let targetTweenMs = 120;        // default smoothing window (ms), adapts to network cadence
+    let lastArrival = performance.now();
+
+    function ensureBuffers(N) {
+      const needAlloc = !geom.getAttribute('position') || geom.getAttribute('position').count !== N;
+      if (needAlloc) {
+        curPos = new Float32Array(N * 3);
+        curCol = new Float32Array(N * 3);
+        lastPos = new Float32Array(N * 3);
+        nextPos = new Float32Array(N * 3);
+        geom.setAttribute('position', new THREE.BufferAttribute(curPos, 3));
+        geom.setAttribute('color',    new THREE.BufferAttribute(curCol, 3));
+      } else {
+        curPos = geom.getAttribute('position').array;
+        curCol = geom.getAttribute('color').array;
+        if (!lastPos || lastPos.length !== curPos.length) lastPos = new Float32Array(curPos.length);
+        if (!nextPos || nextPos.length !== curPos.length) nextPos = new Float32Array(curPos.length);
+      }
+    }
+
+    // ---------- Parse incoming binary frames ----------
+    // [header_len(uint32)][header(JSON)][(pad 0..3 bytes)][depth float32 (w*h)][rgb u8 (3*w*h)]
+    function parseFrame(buffer) {
+      const dv = new DataView(buffer);
+      const headerLen = dv.getUint32(0, true);
+      let offset = 4;
+      if (headerLen === 0) return { hello: true };
+
+      const headerStr = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen));
+      offset += headerLen;
+
+      // align to 4 bytes for Float32Array safety
+      const misalign = offset & 3;
+      if (misalign) offset += (4 - misalign);
+
+      const header = JSON.parse(headerStr);
+      const N = header.w * header.h;
+
+      const depth = new Float32Array(buffer, offset, N);
+      offset += N * 4;
+
+      const rgb = new Uint8Array(buffer, offset, N * 3);
+
+      return { header, depth, rgb };
+    }
+
+    // ---------- Point-cloud unprojection into target buffer ----------
+    function unprojectInto(targetArray, colorArrayOrNull, header, depth, rgb) {
+      const { w, h, fx, fy, cx, cy } = header;
+      let k = 0, c = 0;
+      for (let v = 0; v < h; v++) {
+        for (let u = 0; u < w; u++) {
+          const i = v * w + u;
+          const Z = depth[i];
+          const X = (u - cx) / fx * Z;
+          const Y = (v - cy) / fy * Z;
+
+          // world orientation
+          targetArray[k++] =  X;
+          targetArray[k++] = -Y;
+          targetArray[k++] = -Z;
+
+          if (colorArrayOrNull) {
+            colorArrayOrNull[i*3    ] = rgb[c++] / 255;
+            colorArrayOrNull[i*3 + 1] = rgb[c++] / 255;
+            colorArrayOrNull[i*3 + 2] = rgb[c++] / 255;
+          } else {
+            c += 3;
+          }
+        }
+      }
+    }
+
+    // ---------- Network & tween handling ----------
+    let statusText = "connecting…";
+
+    function onNewNetworkFrame(parsed) {
+      const { header, depth, rgb } = parsed;
+      const N = header.w * header.h;
+      ensureBuffers(N);
+
+      // next -> last
+      lastPos.set(nextPos);
+
+      // fill next with new positions; update colors once per frame
+      unprojectInto(nextPos, curCol, header, depth, rgb);
+      geom.getAttribute('color').needsUpdate = true;
+
+      // reset tween and adapt duration to inter-arrival time
+      const now = performance.now();
+      const inter = Math.min(300, Math.max(30, now - lastArrival));
+      lastArrival = now;
+      targetTweenMs = 0.8 * targetTweenMs + 0.2 * inter;
+      tweenT = 0;
+
+      statusText = `w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms`;
+    }
+
+    // ---------- Render: mix lastPos → nextPos over time ----------
+    let lastFrameT = performance.now();
+    function render() {
+      const t = performance.now();
+      const dt = t - lastFrameT; lastFrameT = t;
+
+      if (tweenT < 1 && curPos && nextPos && lastPos) {
+        const step = dt / Math.max(1, targetTweenMs);
+        tweenT = Math.min(1, tweenT + step);
+
+        // curPos = mix(lastPos, nextPos, tweenT)
+        const L = curPos.length;
+        const a = 1 - tweenT, b = tweenT;
+        for (let i = 0; i < L; i++) {
+          curPos[i] = a * lastPos[i] + b * nextPos[i];
+        }
+        geom.getAttribute('position').needsUpdate = true;
+        geom.computeBoundingSphere();
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(render);
+    }
+
+    // ---------- Overlay FPS/status ----------
+    let lastTs = performance.now(), frames = 0;
+    function tickOverlay() {
+      const now = performance.now();
+      frames++;
+      if (now - lastTs >= 1000) {
+        overlay.textContent = `${statusText} | ${frames} fps`;
+        frames = 0;
+        lastTs = now;
+      }
+      requestAnimationFrame(tickOverlay);
+    }
+
+    // ---------- WebSocket ----------
+    const ws = new WebSocket("ws://localhost:8765");
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => { statusText = "connected"; };
+    ws.onmessage = (ev) => {
+      const parsed = parseFrame(ev.data);
+      if (parsed.hello) return;
+      onNewNetworkFrame(parsed);
+    };
+    ws.onclose = () => { statusText = "disconnected"; };
+
+    // start loops
+    tickOverlay();
+    render();
+  </script>
+</body>
+</html>
