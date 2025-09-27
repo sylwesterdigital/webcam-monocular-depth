@@ -1,142 +1,93 @@
-# Live Depth Point Cloud (Webcam → MiDaS → WebSocket → Three.js)
+Nice — the build **succeeded** 🎉 You’ve got a signed `.app` in `dist/LiveDepth.app`. Here’s exactly what to do next and how to hand it to other Mac users.
 
-Real-time “holographic” point cloud in the browser.
-Python reads a webcam, estimates per-pixel depth with MiDaS, streams depth+RGB over WebSocket; a Three.js client unprojects to 3D and renders a colored point cloud with **smooth tweening** between frames.
+# 1) Quick local test
 
-## Demo
+1. Open Finder → `dist/LiveDepth.app` → right-click → **Open** (first run bypasses Gatekeeper).
+2. When macOS asks for **Camera** permission, click **OK**.
+3. Your viewer should connect to the local server and show the point cloud.
 
-https://github.com/user-attachments/assets/1cb5da49-d9f7-46f6-a85b-b25ac00eb140
+   * Keyboard: `P` pause, `S` save PNG, `F` fullscreen, `1..4` rain modes, `G/Shift+G` GLB/GLTF export, `B` build-in, `D` dissolve, `R` reset.
 
----
+If the app window stays blank or quits:
 
-## Features
+* Run it from Terminal to see logs:
 
-* Monocular depth (MiDaS) — no extra hardware.
-* Live colored point cloud in Three.js.
-* **Inertia smoothing** in the client to hide low/irregular frame rates.
-* Zero build step on the client (ESM + CDN import map).
-* Binary protocol (compact): header JSON + depth32 + rgb8.
-* Optional synthetic **TEST_PATTERN** for quick end-to-end checks.
+  ```bash
+  ./dist/LiveDepth.app/Contents/MacOS/LiveDepth
+  ```
+* Check **System Settings → Privacy & Security → Camera** and ensure “LiveDepth” is allowed.
+* If you get “address in use”, something is already on port 8765. Quit that app or change your server port and rebuild.
 
----
+# 2) First-run model weights (important)
 
-## Repo layout
+Your server uses `torch.hub.load("intel-isl/MiDaS", ...)`. On a *first* run, PyTorch may download the MiDaS repo/weights to `~/.cache/torch/hub`. Two options:
 
-```
-.
-├─ server.py            # Python WebSocket depth streamer
-└─ client/
-   └─ index.html        # Three.js viewer (with tweened point motion)
-```
+* **Simplest**: run the app once on a machine with internet so the weights cache populates. After that, it works offline.
+* **Portable/offline**: put the MiDaS repo & weights inside your app:
 
----
+  1. Pre-download MiDaS into your project (e.g. `weights/midas/…`) and modify your `server.py` to load locally (example):
 
-## Quick start
+     ```python
+     REPO = os.path.join(os.path.dirname(__file__), "weights", "midas")
+     midas = torch.hub.load(REPO, MODEL_TYPE, source="local").to(device).eval()
+     ```
+  2. You already bundle `weights/` via the spec, so it’ll ship inside the `.app`. Rebuild.
 
-### 1) Python env (macOS recommended)
+# 3) Share it with people
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install opencv-python torch torchvision torchaudio pillow websockets numpy timm
-```
-
-### 2) Run the streamer
+The **fastest** way: zip the app.
 
 ```bash
-# Real webcam + MiDaS
-python server.py
-
-# Or: synthetic test pattern (no camera/model), proves client path
-TEST_PATTERN=1 python server.py
+cd dist
+zip -r LiveDepth-macOS-arm64.zip LiveDepth.app
 ```
 
-The console shows: `Streaming on ws://localhost:8765 …`
+Send that zip. The recipient will:
 
-> macOS: allow Camera access for the terminal app (System Settings → Privacy & Security → Camera).
-> If webcam not found, try `WEBCAM_INDEX=1 python server.py`.
+* Unzip → right-click **Open** (first run) → allow Camera.
+* If they get “unidentified developer”, right-click Open solves it.
 
-### 3) Open the viewer
+# 4) Optional: reduce size
 
-Open `client/index.html` in a modern browser (Chrome recommended).
-The overlay will show resolution and FPS; use the mouse to orbit/zoom.
+You’re pulling in a lot of PyTorch subpackages you don’t use (and torchaudio). Two easy trims:
 
----
+* Exclude torchaudio (and its libsox noise) in your spec:
 
-## How it works
+  ```python
+  excludes=['torchaudio', 'tensorflow']
+  ```
 
-### Data flow
+  Then rebuild.
 
-```
-Webcam → OpenCV → MiDaS (PyTorch) → depth map
- → subsample/normalize → pack (header + depth + rgb)
- → WebSocket → Browser → unproject → Three.js Point cloud
- → tween between frames for smooth motion
-```
+* If you don’t use `torchvision`, remove its `collect_all()` and hidden-import entries.
 
-### Binary frame format
+# 5) Optional: proper codesigning + notarization (no “Open anyway”)
 
-```
-[ uint32 header_len ]
-[ header JSON (UTF-8) ]
-[ 0..3 bytes padding to 4-byte boundary ]
-[ depth  float32 array, length = w*h ]
-[ rgb    uint8   array, length = 3*w*h ]
-```
-
-`header` contains: `{ w,h, fx,fy, cx,cy, stride, ts }`.
-
----
-
-## Configuration (env vars)
-
-| Var             | Default       | Meaning                                                   |
-| --------------- | ------------- | --------------------------------------------------------- |
-| `WEBCAM_INDEX`  | `0`           | Camera index for OpenCV.                                  |
-| `TARGET_WIDTH`  | `640`         | Width used for inference (keeps aspect).                  |
-| `STRIDE`        | `2`           | Subsampling factor (1 = full res).                        |
-| `FOV_DEG`       | `60.0`        | Approx horizontal FOV for intrinsics.                     |
-| `MODEL_TYPE`    | `MiDaS_small` | MiDaS variant (`MiDaS_small`, `DPT_Hybrid`, `DPT_Large`). |
-| `EMA_ALPHA`     | `0.2`         | Temporal EMA smoothing of depth on server.                |
-| `CLAMP_NEAR`    | `0.2`         | Near clamp of (pseudo-metric) depth.                      |
-| `CLAMP_FAR`     | `4.0`         | Far clamp of depth.                                       |
-| `TEST_PATTERN`  | `0`           | `1` = enable synthetic rotating plane.                    |
-| `LOG_EVERY_SEC` | `2.0`         | Server stats log interval (seconds).                      |
-
-Set via:
+If you have an Apple Developer ID:
 
 ```bash
-STRIDE=3 TARGET_WIDTH=800 MODEL_TYPE=DPT_Hybrid python server.py
+# 5a) Ad-hoc sign (already done by PyInstaller, but you can re-sign)
+codesign --force --deep --options runtime --sign - "dist/LiveDepth.app"
+
+# 5b) Sign with your Developer ID cert
+codesign --force --deep --options runtime --sign "Developer ID Application: Your Name (TEAMID)" dist/LiveDepth.app
+
+# 5c) Notarize (App Store Connect creds or API key configured)
+xcrun notarytool submit dist/LiveDepth.app --keychain-profile "AC_PASSWORD" --wait
+xcrun stapler staple dist/LiveDepth.app
 ```
 
----
+After stapling, users can double-click with no warnings.
 
-## Client smoothing (tweening)
+# 6) Troubleshooting you might hit
 
-The client keeps three buffers:
+* **TensorBoard warning**: harmless (`No module named 'tensorboard'`). You’re not using it.
+* **Huge app size**: normal with PyTorch. Trim packages as in step 4.
+* **No camera feed**: wrong webcam index — set `WEBCAM_INDEX=0/1` in your code or add a small UI/Config file. Because double-click apps don’t read shell envs, read a `config.json` alongside `server.py` instead.
+* **MPS not used**: first time PyTorch MPS warms up slowly. Logs should still say `mps: True`. If you see CPU fallback, ensure macOS ≥ 13 and a Metal-capable Mac.
 
-* `lastPos` (previous positions),
-* `nextPos` (latest positions from the network),
-* `position` (rendered, CPU-mixed each `requestAnimationFrame`).
+# 7) Smoke tests (quick)
 
-Blend window (`targetTweenMs`) adapts to network inter-arrival time (typ. 80–200 ms).
-For heavier inertia, increase the initial value in `index.html`:
-
-```js
-let targetTweenMs = 160; // e.g., 160–240 for smoother glide
-```
-
----
-
-## Troubleshooting
-
-* **Black screen, no overlay updates:** check that `server.py` prints `Streaming on ws://localhost:8765`; verify the browser devtools network/WebSocket shows traffic.
-* **Camera not opening:** grant Camera permission; try `WEBCAM_INDEX=1`.
-* **Very slow on CPU:** switch to `MiDaS_small` (default) or ensure Apple Silicon uses MPS (automatically selected).
-* **Misaligned typed arrays:** server pads header to a 4-byte boundary; the client also aligns before reading `Float32Array`.
-
----
-
-## License
-
-MIT (or add your preferred license).
+* Launch, allow camera, confirm FPS in overlay.
+* Hit `G` to export a `.glb` and open it in Quick Look or Blender.
+* Toggle `TEST_PATTERN=1` in your code and rebuild if you want a demo without a camera.

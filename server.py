@@ -1,8 +1,8 @@
-# server.py
+#!/usr/bin/env python3
 # macOS / Python 3.10+ recommended
 # pip install opencv-python torch torchvision torchaudio pillow websockets numpy timm
 
-import asyncio, struct, json, time, os, logging
+import asyncio, struct, json, time, os, logging, subprocess, sys, re, shutil, socket
 import cv2
 import numpy as np
 import torch
@@ -10,28 +10,112 @@ import websockets
 
 # ------------------------ config ------------------------
 WEBCAM_INDEX = int(os.getenv("WEBCAM_INDEX", "0"))
+WEBCAM_NAME  = os.getenv("WEBCAM_NAME", "").strip()  # optional, macOS AVFoundation name (e.g. 'FaceTime HD Camera')
 TARGET_WIDTH = int(os.getenv("TARGET_WIDTH", "640"))
-STRIDE = int(os.getenv("STRIDE", "2"))                # 1=full res; 2/3 reduces payload
-FOV_DEG = float(os.getenv("FOV_DEG", "60.0"))
-PORT = int(os.getenv("PORT", "8765"))
-MODEL_TYPE = os.getenv("MODEL_TYPE", "MiDaS_small")   # "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
-EMA_ALPHA = float(os.getenv("EMA_ALPHA", "0.2"))
-CLAMP_NEAR = float(os.getenv("CLAMP_NEAR", "0.2"))
-CLAMP_FAR  = float(os.getenv("CLAMP_FAR", "4.0"))
-TEST_PATTERN = bool(int(os.getenv("TEST_PATTERN", "0")))  # 1 = synth rotating slab to debug client
-LOG_EVERY_SEC = float(os.getenv("LOG_EVERY_SEC", "2.0"))
+STRIDE       = int(os.getenv("STRIDE", "2"))         # 1=full res; 2/3 reduces payload
+FOV_DEG      = float(os.getenv("FOV_DEG", "60.0"))
+PORT         = int(os.getenv("PORT", "8765"))
+BIND_HOST    = os.getenv("BIND_HOST", "127.0.0.1")   # force IPv4 to match ws://127.0.0.1
+MODEL_TYPE   = os.getenv("MODEL_TYPE", "MiDaS_small")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
+EMA_ALPHA    = float(os.getenv("EMA_ALPHA", "0.2"))
+CLAMP_NEAR   = float(os.getenv("CLAMP_NEAR", "0.2"))
+CLAMP_FAR    = float(os.getenv("CLAMP_FAR",  "4.0"))
+TEST_PATTERN = bool(int(os.getenv("TEST_PATTERN", "0")))  # 1 = synthetic pattern
+LOG_EVERY_SEC= float(os.getenv("LOG_EVERY_SEC", "2.0"))
 # --------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("depth-stream")
 
 device = torch.device("mps" if torch.backends.mps.is_available() else
                       "cuda" if torch.cuda.is_available() else "cpu")
 log.info(f"device = {device}")
+
+def intrinsics(w, h, fov_deg):
+    f = 0.5 * w / np.tan(np.deg2rad(fov_deg) / 2.0)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    return f, f, cx, cy
+
+def normalize_depth(d):
+    if not np.isfinite(d).all():
+        d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+    d = d - np.min(d)
+    maxv = float(np.max(d))
+    if maxv > 1e-6:
+        d = d / maxv
+    return CLAMP_NEAR + (CLAMP_FAR - CLAMP_NEAR) * d
+
+def make_test_pattern(t, w, h):
+    xx, yy = np.meshgrid(np.linspace(-1, 1, w, dtype=np.float32),
+                         np.linspace(-1, 1, h, dtype=np.float32))
+    angle = 0.6 * np.sin(t * 0.7)
+    Z = 1.5 + 0.5 * (xx * np.cos(angle) + yy * np.sin(angle))
+    Z = np.clip(Z, CLAMP_NEAR, CLAMP_FAR).astype(np.float32)
+    r = (0.5 + 0.5 * np.sin(6.28 * xx + t)).astype(np.float32)
+    g = (0.5 + 0.5 * np.sin(6.28 * yy + t*1.3)).astype(np.float32)
+    b = (0.5 + 0.5 * np.sin(6.28 * (xx+yy) + t*0.9)).astype(np.float32)
+    rgb = np.stack([r, g, b], axis=-1)  # h,w,3
+    rgb = (rgb * 255).astype(np.uint8).reshape(-1,3)
+    return Z, rgb
+
+def ffmpeg_path():
+    return shutil.which("ffmpeg")
+
+def enumerate_avfoundation_devices():
+    """macOS: returns list of (index:int, name:str) for AVFoundation video devices. Requires ffmpeg."""
+    if sys.platform != "darwin":
+        return []
+    ff = ffmpeg_path()
+    if not ff:
+        return []
+    try:
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, text=True
+        )
+        out = proc.stdout
+        devices = []
+        for line in out.splitlines():
+            m = re.search(r"\[AVFoundation indev .*?\]\s*\[(\d+)\]\s*(.+)", line)
+            if m and "video devices" not in line.lower() and "audio devices" not in line.lower():
+                idx = int(m.group(1))
+                name = m.group(2).strip()
+                if not name.lower().startswith("capture screen"):
+                    devices.append((idx, name))
+        return devices
+    except Exception as e:
+        log.warning(f"ffmpeg enumerate failed: {e}")
+        return []
+
+def enumerate_cv2_guess(max_index=8):
+    """Fallback when ffmpeg listing isn't available."""
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            found.append((i, f"Camera {i}"))
+        cap.release()
+    return found
+
+def resolve_webcam_index(name_pref: str, fallback_index: int) -> int:
+    name_pref = (name_pref or "").strip()
+    if not name_pref:
+        return fallback_index
+    devs = enumerate_avfoundation_devices()
+    if not devs:
+        log.warning("No AVFoundation device listing. Falling back to WEBCAM_INDEX.")
+        return fallback_index
+    for idx, nm in devs:
+        if nm == name_pref:
+            log.info(f"WEBCAM_NAME='{name_pref}' -> index {idx}")
+            return idx
+    name_l = name_pref.lower()
+    for idx, nm in devs:
+        if name_l in nm.lower():
+            log.info(f"WEBCAM_NAME~='{name_pref}' matched '{nm}' -> index {idx}")
+            return idx
+    log.warning(f"WEBCAM_NAME='{name_pref}' not found. Using WEBCAM_INDEX={fallback_index}.")
+    return fallback_index
 
 # ---------- Model (skipped if TEST_PATTERN) ----------
 if not TEST_PATTERN:
@@ -40,72 +124,45 @@ if not TEST_PATTERN:
     midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
     transform = midas_transforms.dpt_transform if MODEL_TYPE in ["DPT_Large", "DPT_Hybrid"] else midas_transforms.small_transform
 
-# ---------- Camera ----------
+# ---------- Camera open/switch ----------
 cap = None
+resolved_index = WEBCAM_INDEX
+
+def open_camera(index: int):
+    global cap, resolved_index
+    if cap is not None:
+        try: cap.release()
+        except: pass
+    c = cv2.VideoCapture(index)
+    c.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    if not c.isOpened():
+        raise RuntimeError(f"Cannot open webcam index {index}")
+    cap = c
+    resolved_index = index
+    log.info(f"Opened camera index {index}")
+
 if not TEST_PATTERN:
-    cap = cv2.VideoCapture(WEBCAM_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open webcam index {WEBCAM_INDEX}")
-
-def intrinsics(w, h, fov_deg):
-    f = 0.5 * w / np.tan(np.deg2rad(fov_deg) / 2.0)
-    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
-    return f, f, cx, cy
-
-def normalize_depth(d):
-    # Handle NaNs/Infs
-    n_nan = np.count_nonzero(~np.isfinite(d))
-    if n_nan:
-        d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
-    # Normalize to [0,1] and scale to pseudo-meters
-    d = d - d.min()
-    maxv = d.max()
-    if maxv > 1e-6:
-        d = d / maxv
-    # map to [CLAMP_NEAR, CLAMP_FAR]
-    return CLAMP_NEAR + (CLAMP_FAR - CLAMP_NEAR) * d
-
-def make_test_pattern(t, w, h):
-    """
-    Generate a rotating slanted plane depth with simple color bands.
-    Ensures client renders even if the camera/model is broken.
-    """
-    xx, yy = np.meshgrid(np.linspace(-1, 1, w, dtype=np.float32),
-                         np.linspace(-1, 1, h, dtype=np.float32))
-    angle = 0.6 * np.sin(t * 0.7)
-    Z = 1.5 + 0.5 * (xx * np.cos(angle) + yy * np.sin(angle))
-    Z = np.clip(Z, CLAMP_NEAR, CLAMP_FAR).astype(np.float32)
-    # Color stripes
-    r = (0.5 + 0.5 * np.sin(6.28 * xx + t)).astype(np.float32)
-    g = (0.5 + 0.5 * np.sin(6.28 * yy + t*1.3)).astype(np.float32)
-    b = (0.5 + 0.5 * np.sin(6.28 * (xx+yy) + t*0.9)).astype(np.float32)
-    rgb = np.stack([r, g, b], axis=-1)  # h,w,3 in [0,1]
-    rgb = (rgb * 255).astype(np.uint8).reshape(-1,3)
-    return Z, rgb
+    resolved_index = resolve_webcam_index(WEBCAM_NAME, WEBCAM_INDEX)
+    open_camera(resolved_index)
 
 ema_depth = None
-
-# Stats
 frame_count = 0
 send_count = 0
 last_log_t = time.time()
 
 async def frame_stream(websocket):
+    """Producer: stream frames to the connected client."""
     global ema_depth, frame_count, send_count, last_log_t
-
     log.info("client connected; starting stream loop")
 
     while True:
         t0 = time.time()
 
         if TEST_PATTERN:
-            # Synthesize a frame at TARGET_WIDTH (scaled height ~ 16:9)
             w = TARGET_WIDTH
             h = int(TARGET_WIDTH * 9 / 16)
             d_norm, rgb = make_test_pattern(t0, w // STRIDE, h // STRIDE)
-            # Already subsampled & clamped; build intrinsics
             hs, ws = d_norm.shape[:2]
             fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
         else:
@@ -113,33 +170,28 @@ async def frame_stream(websocket):
             if not ok:
                 await asyncio.sleep(0.01)
                 continue
-
             h0, w0 = frame.shape[:2]
             scale = TARGET_WIDTH / float(w0)
             w = int(w0 * scale); h = int(h0 * scale)
             frame_s = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
             rgb_full = cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB)
 
-            # Depth inference
             with torch.no_grad():
                 inp = transform(rgb_full).to(device, dtype=torch.float32)
-                pred = midas(inp)                               # [H',W'] -> logits
+                pred = midas(inp)
                 depth = torch.nn.functional.interpolate(
                     pred.unsqueeze(1), size=(h, w),
                     mode="bicubic", align_corners=False
                 ).squeeze().cpu().numpy()
 
             d_norm = normalize_depth(depth)
-            # EMA smoothing
             ema_depth = d_norm if ema_depth is None else (EMA_ALPHA * d_norm + (1.0 - EMA_ALPHA) * ema_depth)
 
-            # Subsample for bandwidth
             d_norm = ema_depth[::STRIDE, ::STRIDE].astype(np.float32, copy=False)
             rgb = rgb_full[::STRIDE, ::STRIDE].reshape(-1, 3).astype(np.uint8, copy=False)
             hs, ws = d_norm.shape[:2]
             fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
 
-        # Header
         header = {
             "w": int(ws), "h": int(hs),
             "fx": float(fx), "fy": float(fy),
@@ -152,13 +204,10 @@ async def frame_stream(websocket):
         pad = (4 - (len(header_bytes) & 3)) & 3
         pad_bytes = b"\x00" * pad
 
-        # Payload
         depth_bytes = d_norm.astype(np.float32, copy=False).tobytes(order="C")
-        rgb_bytes = rgb.tobytes(order="C")
-
+        rgb_bytes   = rgb.tobytes(order="C")
         blob = b"".join([header_len, header_bytes, pad_bytes, depth_bytes, rgb_bytes])
 
-        # Send
         try:
             await websocket.send(blob)
             send_count += 1
@@ -167,37 +216,80 @@ async def frame_stream(websocket):
             break
 
         frame_count += 1
-
-        # Periodic log
         now = time.time()
         if now - last_log_t >= LOG_EVERY_SEC:
             size_kb = len(blob) / 1024.0
             dmin = float(np.min(d_norm)) if d_norm.size else -1
             dmax = float(np.max(d_norm)) if d_norm.size else -1
             dmean = float(np.mean(d_norm)) if d_norm.size else -1
-            log.info(
-                f"frames={frame_count} sent={send_count} | "
-                f"grid={ws}x{hs} N={ws*hs} | blob={size_kb:.1f} KB | "
-                f"depth[min/mean/max]={dmin:.3f}/{dmean:.3f}/{dmax:.3f}"
-            )
+            log.info(f"frames={frame_count} sent={send_count} | grid={ws}x{hs} N={ws*hs} | blob={size_kb:.1f} KB | depth[min/mean/max]={dmin:.3f}/{dmean:.3f}/{dmax:.3f}")
             last_log_t = now
 
-        # Keep the loop cooperative
         await asyncio.sleep(0)
 
+async def send_json(ws, obj):
+    try:
+        await ws.send(json.dumps(obj))
+    except Exception as e:
+        log.warning(f"send_json failed: {e}")
+
+def camera_listing():
+    av = enumerate_avfoundation_devices()
+    items = av if av else enumerate_cv2_guess(8)
+    return [{"index": i, "name": n} for i, n in items]
+
+async def control_loop(ws):
+    """Consumer: handle JSON control messages."""
+    async for msg in ws:
+        if isinstance(msg, (bytes, bytearray)):
+            # ignore binary from client
+            continue
+        try:
+            data = json.loads(msg)
+        except Exception:
+            continue
+        cmd = data.get("cmd")
+        if cmd == "list_cams":
+            await send_json(ws, {"type":"cams","items":camera_listing(),"selected":resolved_index})
+        elif cmd == "set_cam":
+            idx = int(data.get("index", resolved_index))
+            try:
+                if not TEST_PATTERN:
+                    open_camera(idx)
+                await send_json(ws, {"type":"set_cam_ok","index":idx})
+            except Exception as e:
+                await send_json(ws, {"type":"set_cam_err","error":str(e)})
+        else:
+            # ignore unknown
+            pass
+
 async def handler(websocket):
-    # Send a hello frame (just 4 bytes for header length == 0)
+    # hello (header length == 0)
     await websocket.send(struct.pack("<I", 0))
-    await frame_stream(websocket)
+    producer = asyncio.create_task(frame_stream(websocket))
+    consumer = asyncio.create_task(control_loop(websocket))
+    done, pending = await asyncio.wait({producer, consumer}, return_when=asyncio.FIRST_EXCEPTION)
+    for task in pending:
+        task.cancel()
 
 async def main():
-    async with websockets.serve(handler, "localhost", PORT, max_size=None, ping_interval=20):
-        log.info(f"Streaming on ws://localhost:{PORT} | TEST_PATTERN={int(TEST_PATTERN)} | stride={STRIDE}")
+    # Ensure bind host is reachable (helpful log)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((BIND_HOST, 0)); s.close()
+    except Exception:
+        log.warning(f"BIND_HOST '{BIND_HOST}' may not be reachable")
+
+    async with websockets.serve(handler, BIND_HOST, PORT, max_size=None, ping_interval=20):
+        log.info(f"Streaming on ws://{BIND_HOST}:{PORT} | TEST_PATTERN={int(TEST_PATTERN)} | stride={STRIDE} | cam_index={resolved_index} name='{WEBCAM_NAME}'")
         await asyncio.Future()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
-        if cap is not None:
-            cap.release()
+        try:
+            if 'cap' in globals() and cap is not None:
+                cap.release()
+        except:
+            pass
