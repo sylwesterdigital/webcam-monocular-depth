@@ -1,5 +1,7 @@
 # LiveDepth
 
+<img width="5120" height="2880" alt="pointcloud_2025-09-27_00-08-53" src="https://github.com/user-attachments/assets/cdc896fe-c3b6-4335-ab0e-7a53d9571995" />
+
 LiveDepth is a **real-time monocular depth streaming app** for macOS.  
 It uses **PyTorch MiDaS models** to infer per-pixel depth from a webcam feed (or a synthetic test pattern), and streams results over **WebSockets** to a browser-based 3D viewer.  
 
