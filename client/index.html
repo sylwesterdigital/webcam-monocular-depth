@@ -509,167 +509,174 @@ function stopWebcam(){ if (camTimer) cancelAnimationFrame(camTimer); camTimer=nu
 
   // Prefer secure WSS first (matches the bundled WSS server), then fall back to WS for dev.
 function buildWSCandidates(port){
-  const hosts = [location.hostname, "127.0.0.1", "localhost"].filter(Boolean);
+  const host = location.hostname; // exactly how the page was opened
   const urls = [];
-    for (const h of hosts){ urls.push(`wss://${h}:${port}`); } // try WSS first
-    for (const h of hosts){ urls.push(`ws://${h}:${port}`); }  // then WS fallback
-      return urls.filter((u,i,a)=>a.indexOf(u)===i);
+  if (location.protocol === "https:") {
+    urls.push(`wss://${host}:${port}`);
+    urls.push(`ws://${host}:${port}`);   // rare fallback
+  } else {
+    urls.push(`ws://${host}:${port}`);
+    urls.push(`wss://${host}:${port}`);  // rare fallback
   }
+  // If you *really* want a last-resort, add one of these:
+  // urls.push(`${location.protocol==='https:'?'wss':'ws'}://127.0.0.1:${port}`);
+  return urls;
+}
 
-  function startWSStream(){
-    stopWebcam(); stopWS();
+function startWSStream(){
+  stopWebcam(); stopWS();
 
-    const q=new URLSearchParams(location.search);
-    const port = Number(q.get("port") || 8765);
-    wsURLs = buildWSCandidates(port);
-    wsTry=0;
-    console.log("[viewer] WS candidates (wss first):", wsURLs);
+  const q=new URLSearchParams(location.search);
+  const port = Number(q.get("port") || 8765);
+  wsURLs = buildWSCandidates(port);
+  wsTry=0;
+  console.log("[viewer] WS candidates (wss first):", wsURLs);
 
-    const backoffBase=500, backoffMax=4000;
+  const backoffBase=500, backoffMax=4000;
 
-    const tryConnect=()=>{
-      const url = wsURLs[wsTry % wsURLs.length]; wsTry++;
-      const attempt = wsTry;
-      statusText = `WS connecting ${url} (attempt ${attempt})`;
+  const tryConnect=()=>{
+    const url = wsURLs[wsTry % wsURLs.length]; wsTry++;
+    const attempt = wsTry;
+    statusText = `WS connecting ${url} (attempt ${attempt})`;
+    overlay.classList.add("error");
+    overlay.textContent=statusText;
+    console.log(`[viewer] trying ${url} (attempt ${attempt})`);
+
+    const sock = new WebSocket(url);
+    ws = sock; ws.binaryType="arraybuffer";
+
+    sock.onopen = ()=>{
+      wsConnected=true; setBarsState();
+      statusText=`connected (${url})`;
+      overlay.classList.remove("error");
+      overlay.textContent=statusText;
+      console.log(`[viewer] connected ${url}`);
+      try{ ws.send(JSON.stringify({cmd:"list_cams"})); }catch{}
+    };
+
+    sock.onmessage=(ev)=>{
+      if (typeof ev.data === "string"){
+        try{
+          const msg=JSON.parse(ev.data);
+          if (msg.type==="cams"){
+            srvSelect.innerHTML="";
+            msg.items.forEach(it=>{ const o=document.createElement("option"); o.value=String(it.index); o.textContent=`[${it.index}] ${it.name}`; srvSelect.appendChild(o); });
+            if (msg.selected != null) srvSelect.value=String(msg.selected);
+            setBarsState();
+          } else if (msg.type==="set_cam_ok"){ srvSelect.value=String(msg.index); }
+          else if (msg.type==="set_cam_err"){ console.warn("Server set_cam failed:", msg.error); }
+        }catch(e){ console.warn("JSON msg parse error", e); }
+        return;
+      }
+      const parsed = parseFrame(ev.data);
+      if (parsed.hello){
+        console.log("[viewer] server hello (headerLen=0)");
+        return;
+      }
+      onNewNetworkFrame(parsed);
+    };
+
+    sock.onerror = (e)=>{ console.warn("[viewer] ws error", e); };
+
+    sock.onclose = ()=>{
+      wsConnected=false; setBarsState();
+      const d = Math.min(backoffMax, backoffBase * Math.pow(1.6, Math.min(wsTry,6)));
+      statusText=`DISCONNECTED · retrying in ${Math.round(d)}ms`;
       overlay.classList.add("error");
       overlay.textContent=statusText;
-      console.log(`[viewer] trying ${url} (attempt ${attempt})`);
-
-      const sock = new WebSocket(url);
-      ws = sock; ws.binaryType="arraybuffer";
-
-      sock.onopen = ()=>{
-        wsConnected=true; setBarsState();
-        statusText=`connected (${url})`;
-        overlay.classList.remove("error");
-        overlay.textContent=statusText;
-        console.log(`[viewer] connected ${url}`);
-        try{ ws.send(JSON.stringify({cmd:"list_cams"})); }catch{}
-      };
-
-      sock.onmessage=(ev)=>{
-        if (typeof ev.data === "string"){
-          try{
-            const msg=JSON.parse(ev.data);
-            if (msg.type==="cams"){
-              srvSelect.innerHTML="";
-              msg.items.forEach(it=>{ const o=document.createElement("option"); o.value=String(it.index); o.textContent=`[${it.index}] ${it.name}`; srvSelect.appendChild(o); });
-              if (msg.selected != null) srvSelect.value=String(msg.selected);
-              setBarsState();
-            } else if (msg.type==="set_cam_ok"){ srvSelect.value=String(msg.index); }
-            else if (msg.type==="set_cam_err"){ console.warn("Server set_cam failed:", msg.error); }
-          }catch(e){ console.warn("JSON msg parse error", e); }
-          return;
-        }
-        const parsed = parseFrame(ev.data);
-        if (parsed.hello){
-          console.log("[viewer] server hello (headerLen=0)");
-          return;
-        }
-        onNewNetworkFrame(parsed);
-      };
-
-      sock.onerror = (e)=>{ console.warn("[viewer] ws error", e); };
-
-      sock.onclose = ()=>{
-        wsConnected=false; setBarsState();
-        const d = Math.min(backoffMax, backoffBase * Math.pow(1.6, Math.min(wsTry,6)));
-        statusText=`DISCONNECTED · retrying in ${Math.round(d)}ms`;
-        overlay.classList.add("error");
-        overlay.textContent=statusText;
-        console.warn(`[viewer] ${url} closed. Backing off ${Math.round(d)}ms`);
-        wsTimer = setTimeout(tryConnect, d);
-      };
+      console.warn(`[viewer] ${url} closed. Backing off ${Math.round(d)}ms`);
+      wsTimer = setTimeout(tryConnect, d);
     };
+  };
 
-    tryConnect();
+  tryConnect();
+}
+
+async function startWebcamStream(deviceId=""){
+  stopWS(); stopWebcam();
+  try{
+    const constraints = deviceId ? { video:{ deviceId:{ exact: deviceId } }, audio:false }
+    : { video:{ facingMode:"user" }, audio:false };
+    camStream = await navigator.mediaDevices.getUserMedia(constraints);
+  }catch(e){
+    statusText="camera denied/unavailable";
+    overlay.classList.add("error"); overlay.textContent=statusText; return;
   }
 
-  async function startWebcamStream(deviceId=""){
-    stopWS(); stopWebcam();
-    try{
-      const constraints = deviceId ? { video:{ deviceId:{ exact: deviceId } }, audio:false }
-      : { video:{ facingMode:"user" }, audio:false };
-      camStream = await navigator.mediaDevices.getUserMedia(constraints);
-    }catch(e){
-      statusText="camera denied/unavailable";
-      overlay.classList.add("error"); overlay.textContent=statusText; return;
+  camVideo=document.createElement("video");
+  camVideo.playsInline=true; camVideo.muted=true; camVideo.srcObject=camStream;
+  await camVideo.play().catch(()=>{});
+  camCnv=document.createElement("canvas"); camCtx=camCnv.getContext("2d",{willReadFrequently:true});
+
+  const step=()=>{
+    if (!camVideo || camVideo.readyState<2){ camTimer=requestAnimationFrame(step); return; }
+    const W=Math.max(40, Math.min(params.camWidth|0, camVideo.videoWidth||640));
+    const H=Math.round(W*(camVideo.videoHeight||480)/(camVideo.videoWidth||640))||1;
+    camCnv.width=W; camCnv.height=H;
+
+    camCtx.save();
+    camCtx.translate(params.camFlipX?W:0, params.camFlipY?H:0);
+    camCtx.scale(params.camFlipX?-1:1, params.camFlipY?-1:1);
+    camCtx.drawImage(camVideo,0,0,W,H);
+    camCtx.restore();
+
+    const img=camCtx.getImageData(0,0,W,H);
+    const stride=Math.max(1,params.camStride|0);
+    const wS=Math.floor(W/stride), hS=Math.floor(H/stride), N=wS*hS;
+
+    const depth=new Float32Array(N), rgb=new Uint8Array(N*3);
+    let di=0, ri=0; const s=params.camDepthScale, off=params.camDepthOffset;
+
+    for (let y=0;y<hS;y++) for (let x=0;x<wS;x++){
+      const u=x*stride, v=y*stride, base=(v*W+u)*4;
+      const r=img.data[base]/255, g=img.data[base+1]/255, b=img.data[base+2]/255;
+      const Y=0.2126*r+0.7152*g+0.0722*b;
+      const Z=off+(1-Y)*s;
+      depth[di++]=Z;
+      rgb[ri++]=Math.round(r*255); rgb[ri++]=Math.round(g*255); rgb[ri++]=Math.round(b*255);
     }
 
-    camVideo=document.createElement("video");
-    camVideo.playsInline=true; camVideo.muted=true; camVideo.srcObject=camStream;
-    await camVideo.play().catch(()=>{});
-    camCnv=document.createElement("canvas"); camCtx=camCnv.getContext("2d",{willReadFrequently:true});
+    const fx=0.5*wS/Math.tan((camera.fov*Math.PI/180)/2), fy=fx, cx=(wS-1)/2, cy=(hS-1)/2;
+    const header={ w:wS, h:hS, fx, fy, cx, cy, stride, ts:performance.now() }; lastHeader=header;
 
-    const step=()=>{
-      if (!camVideo || camVideo.readyState<2){ camTimer=requestAnimationFrame(step); return; }
-      const W=Math.max(40, Math.min(params.camWidth|0, camVideo.videoWidth||640));
-      const H=Math.round(W*(camVideo.videoHeight||480)/(camVideo.videoWidth||640))||1;
-      camCnv.width=W; camCnv.height=H;
+    lastPos = lastPos && lastPos.length===N*3 ? lastPos : new Float32Array(N*3);
+    nextPos = nextPos && nextPos.length===N*3 ? nextPos : new Float32Array(N*3);
 
-      camCtx.save();
-      camCtx.translate(params.camFlipX?W:0, params.camFlipY?H:0);
-      camCtx.scale(params.camFlipX?-1:1, params.camFlipY?-1:1);
-      camCtx.drawImage(camVideo,0,0,W,H);
-      camCtx.restore();
+    onNewNetworkFrame({ header, depth, rgb });
+    camTimer=requestAnimationFrame(step);
+  };
 
-      const img=camCtx.getImageData(0,0,W,H);
-      const stride=Math.max(1,params.camStride|0);
-      const wS=Math.floor(W/stride), hS=Math.floor(H/stride), N=wS*hS;
+  step();
+}
 
-      const depth=new Float32Array(N), rgb=new Uint8Array(N*3);
-      let di=0, ri=0; const s=params.camDepthScale, off=params.camDepthOffset;
+function onSourceChanged(){
+  if (params.source===SOURCE.PythonWS){ startWSStream(); }
+  else { startWebcamStream(currentCamId); }
+  setBarsState();
+}
 
-      for (let y=0;y<hS;y++) for (let x=0;x<wS;x++){
-        const u=x*stride, v=y*stride, base=(v*W+u)*4;
-        const r=img.data[base]/255, g=img.data[base+1]/255, b=img.data[base+2]/255;
-        const Y=0.2126*r+0.7152*g+0.0722*b;
-        const Z=off+(1-Y)*s;
-        depth[di++]=Z;
-        rgb[ri++]=Math.round(r*255); rgb[ri++]=Math.round(g*255); rgb[ri++]=Math.round(b*255);
-      }
+function onNewNetworkFrame(parsed){
+  const { header, depth, rgb } = parsed; const N=header.w*header.h;
+  ensureCloudBuffers(N); lastPos.set(nextPos);
+  unprojectInto(nextPos, curCol, header, depth, rgb);
+  cloudGeom.getAttribute('color').needsUpdate=true; lastHeader=header; rebuildGridFromCloud();
+  const now=performance.now(); const inter=Math.min(300,Math.max(30,now-lastArrival)); lastArrival=now;
+  targetTweenMs=0.8*targetTweenMs+0.2*inter; tweenT=0;
+  statusText=`w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms | rain=${RAIN_COUNT}`;
+}
 
-      const fx=0.5*wS/Math.tan((camera.fov*Math.PI/180)/2), fy=fx, cx=(wS-1)/2, cy=(hS-1)/2;
-      const header={ w:wS, h:hS, fx, fy, cx, cy, stride, ts:performance.now() }; lastHeader=header;
+async function bootstrap(){
+  await populateCameraList(false);
+  const hasPort=new URLSearchParams(location.search).has("port");
+  if (hasPort) params.source=SOURCE.PythonWS;
+  if (params.source===SOURCE.PythonWS) startWSStream(); else startWebcamStream(currentCamId);
+  setBarsState();
+}
 
-      lastPos = lastPos && lastPos.length===N*3 ? lastPos : new Float32Array(N*3);
-      nextPos = nextPos && nextPos.length===N*3 ? nextPos : new Float32Array(N*3);
+bootstrap(); render();
 
-      onNewNetworkFrame({ header, depth, rgb });
-      camTimer=requestAnimationFrame(step);
-    };
-
-    step();
-  }
-
-  function onSourceChanged(){
-    if (params.source===SOURCE.PythonWS){ startWSStream(); }
-    else { startWebcamStream(currentCamId); }
-    setBarsState();
-  }
-
-  function onNewNetworkFrame(parsed){
-    const { header, depth, rgb } = parsed; const N=header.w*header.h;
-    ensureCloudBuffers(N); lastPos.set(nextPos);
-    unprojectInto(nextPos, curCol, header, depth, rgb);
-    cloudGeom.getAttribute('color').needsUpdate=true; lastHeader=header; rebuildGridFromCloud();
-    const now=performance.now(); const inter=Math.min(300,Math.max(30,now-lastArrival)); lastArrival=now;
-    targetTweenMs=0.8*targetTweenMs+0.2*inter; tweenT=0;
-    statusText=`w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms | rain=${RAIN_COUNT}`;
-  }
-
-  async function bootstrap(){
-    await populateCameraList(false);
-    const hasPort=new URLSearchParams(location.search).has("port");
-    if (hasPort) params.source=SOURCE.PythonWS;
-    if (params.source===SOURCE.PythonWS) startWSStream(); else startWebcamStream(currentCamId);
-    setBarsState();
-  }
-
-  bootstrap(); render();
-
-  window.addEventListener('resize', ()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); if (paused) renderer.render(scene,camera); });
-  window.addEventListener("beforeunload", ()=>{ stopWS(); stopWebcam(); });
+window.addEventListener('resize', ()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); if (paused) renderer.render(scene,camera); });
+window.addEventListener("beforeunload", ()=>{ stopWS(); stopWebcam(); });
 </script>
 
 

@@ -14,8 +14,12 @@ def _redirect_stdio_to_log():
 _redirect_stdio_to_log()
 
 
+
+# --- config (top of file) ---
 HTTPS_PORT = int(os.getenv("HTTPS_PORT", "8443"))
-WSS_PORT   = int(os.getenv("PORT", "8765"))  # keep in sync with server.py
+WSS_PORT   = int(os.getenv("PORT", "8765"))
+APP_HOST   = os.getenv("APP_HOST", "localhost")  # <— single source of truth for host
+
 CERT_PATH  = os.getenv("HTTPS_CERT_PATH", "certs/localhost+2.pem")
 KEY_PATH   = os.getenv("HTTPS_KEY_PATH",  "certs/localhost+2-key.pem")
 
@@ -48,12 +52,14 @@ def _run_https_static():
     ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
 
     handler = lambda *a, **kw: _QuietHandler(*a, directory=str(CLIENT_DIR), **kw)
-    with socketserver.TCPServer(("127.0.0.1", HTTPS_PORT), handler, bind_and_activate=False) as httpd:
+    #                                                     vvvvvvvvvv
+    with socketserver.TCPServer((APP_HOST, HTTPS_PORT), handler, bind_and_activate=False) as httpd:
         httpd.allow_reuse_address = True
         httpd.server_bind()
         httpd.server_activate()
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         httpd.serve_forever()
+
 
 def _wait_for_port(host, port, timeout=15):
     t0 = time.time()
@@ -66,11 +72,13 @@ def _wait_for_port(host, port, timeout=15):
     return False
 
 def _open_browser():
-    url = f"https://127.0.0.1:{HTTPS_PORT}/?port={WSS_PORT}"
+    # open exactly the same host we bound to
+    url = f"https://{APP_HOST}:{HTTPS_PORT}/?port={WSS_PORT}"
     try:
         webbrowser.open_new_tab(url)
     except Exception:
         os.system(f'open "{url}"')
+
 
 # ---- Menu-bar status item (Cocoa) ----
 from Cocoa import (
@@ -148,7 +156,7 @@ def _run_statusbar_ui():
     _wss_thread.start()
 
     # Wait for HTTPS to be ready then open the page
-    if _wait_for_port("127.0.0.1", HTTPS_PORT, 10):
+    if _wait_for_port(APP_HOST, HTTPS_PORT, 10):
         _open_browser()
 
     AppHelper.runEventLoop()

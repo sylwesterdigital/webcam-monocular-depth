@@ -21,8 +21,6 @@ def _setup_file_logging():
     logging.getLogger("depth-stream").info(f"log file: {logfile}")
 _setup_file_logging()
 
-
-
 # ------------------------ config ------------------------
 WEBCAM_INDEX = int(os.getenv("WEBCAM_INDEX", "0"))
 WEBCAM_NAME  = os.getenv("WEBCAM_NAME", "").strip()  # optional, macOS AVFoundation name (e.g. 'FaceTime HD Camera')
@@ -30,7 +28,7 @@ TARGET_WIDTH = int(os.getenv("TARGET_WIDTH", "640"))
 STRIDE       = int(os.getenv("STRIDE", "2"))         # 1=full res; 2/3 reduces payload
 FOV_DEG      = float(os.getenv("FOV_DEG", "60.0"))
 PORT         = int(os.getenv("PORT", "8765"))
-BIND_HOST    = os.getenv("BIND_HOST", "127.0.0.1")   # keep IPv4 to match localhost
+BIND_HOST    = os.getenv("BIND_HOST", "localhost")   # <— no hardcoded IP; matches page host
 MODEL_TYPE   = os.getenv("MODEL_TYPE", "MiDaS_small")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
 EMA_ALPHA    = float(os.getenv("EMA_ALPHA", "0.2"))
 CLAMP_NEAR   = float(os.getenv("CLAMP_NEAR", "0.2"))
@@ -43,6 +41,10 @@ LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
 USE_TLS          = int(os.getenv("USE_TLS", "1"))     # 1 = WSS (default), 0 = WS
 HTTPS_CERT_PATH  = os.getenv("HTTPS_CERT_PATH", "certs/localhost+2.pem")
 HTTPS_KEY_PATH   = os.getenv("HTTPS_KEY_PATH",  "certs/localhost+2-key.pem")
+
+# WebSocket keepalive (tweakable)
+PING_INTERVAL = float(os.getenv("PING_INTERVAL", "20"))
+PING_TIMEOUT  = float(os.getenv("PING_TIMEOUT",  "20"))
 # --------------------------------------------------------
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -177,85 +179,98 @@ frame_count = 0
 send_count = 0
 last_log_t = time.time()
 
+# --- hardened frame loop (never kills the socket on transient errors) ---
 async def frame_stream(websocket):
-    """Producer: stream frames to the connected client."""
+    """Producer: stream frames to the connected client, never crash the connection."""
     global ema_depth, frame_count, send_count, last_log_t
     peer = getattr(websocket, "remote_address", None)
     log.info("client connected: %s", peer)
 
+    use_test_fallback = TEST_PATTERN  # if we hit an error, flip to synthetic temporarily
+
     while True:
-        t0 = time.time()
-
-        if TEST_PATTERN:
-            w = TARGET_WIDTH
-            h = int(TARGET_WIDTH * 9 / 16)
-            d_norm, rgb = make_test_pattern(t0, w // STRIDE, h // STRIDE)
-            hs, ws = d_norm.shape[:2]
-            fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
-        else:
-            if cap is None:
-                await asyncio.sleep(0.03)
-                continue
-            ok, frame = cap.read()
-            if not ok:
-                await asyncio.sleep(0.01)
-                continue
-            h0, w0 = frame.shape[:2]
-            scale = TARGET_WIDTH / float(w0)
-            w = int(w0 * scale); h = int(h0 * scale)
-            frame_s = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            rgb_full = cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB)
-
-            with torch.no_grad():
-                inp = transform(rgb_full).to(device, dtype=torch.float32)
-                pred = midas(inp)
-                depth = torch.nn.functional.interpolate(
-                    pred.unsqueeze(1), size=(h, w),
-                    mode="bicubic", align_corners=False
-                ).squeeze().cpu().numpy()
-
-            d_norm = normalize_depth(depth)
-            ema_depth = d_norm if ema_depth is None else (EMA_ALPHA * d_norm + (1.0 - EMA_ALPHA) * ema_depth)
-
-            d_norm = ema_depth[::STRIDE, ::STRIDE].astype(np.float32, copy=False)
-            rgb = rgb_full[::STRIDE, ::STRIDE].reshape(-1, 3).astype(np.uint8, copy=False)
-            hs, ws = d_norm.shape[:2]
-            fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
-
-        header = {
-            "w": int(ws), "h": int(hs),
-            "fx": float(fx), "fy": float(fy),
-            "cx": float(cx), "cy": float(cy),
-            "stride": int(STRIDE),
-            "ts": t0
-        }
-        header_bytes = json.dumps(header).encode("utf-8")
-        header_len = struct.pack("<I", len(header_bytes))
-        pad = (4 - (len(header_bytes) & 3)) & 3
-        pad_bytes = b"\x00" * pad
-
-        depth_bytes = d_norm.astype(np.float32, copy=False).tobytes(order="C")
-        rgb_bytes   = rgb.tobytes(order="C")
-        blob = b"".join([header_len, header_bytes, pad_bytes, depth_bytes, rgb_bytes])
-
         try:
+            t0 = time.time()
+
+            if use_test_fallback:
+                w = TARGET_WIDTH
+                h = int(TARGET_WIDTH * 9 / 16)
+                d_norm, rgb = make_test_pattern(t0, w // STRIDE, h // STRIDE)
+                hs, ws = d_norm.shape[:2]
+                fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
+            else:
+                if cap is None:
+                    await asyncio.sleep(0.03)
+                    continue
+
+                ok, frame = cap.read()
+                if not ok:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                h0, w0 = frame.shape[:2]
+                scale = TARGET_WIDTH / float(w0)
+                w = int(w0 * scale); h = int(h0 * scale)
+                frame_s = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                rgb_full = cv2.cvtColor(frame_s, cv2.COLOR_BGR2RGB)
+
+                with torch.no_grad():
+                    inp  = transform(rgb_full).to(device, dtype=torch.float32)
+                    pred = midas(inp)
+                    depth = torch.nn.functional.interpolate(
+                        pred.unsqueeze(1), size=(h, w),
+                        mode="bicubic", align_corners=False
+                    ).squeeze().cpu().numpy()
+
+                d_norm = normalize_depth(depth)
+                ema_depth = d_norm if ema_depth is None else (EMA_ALPHA * d_norm + (1.0 - EMA_ALPHA) * ema_depth)
+
+                d_norm = ema_depth[::STRIDE, ::STRIDE].astype(np.float32, copy=False)
+                rgb    = rgb_full[::STRIDE, ::STRIDE].reshape(-1, 3).astype(np.uint8, copy=False)
+                hs, ws = d_norm.shape[:2]
+                fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
+
+            header = {
+                "w": int(ws), "h": int(hs),
+                "fx": float(fx), "fy": float(fy),
+                "cx": float(cx), "cy": float(cy),
+                "stride": int(STRIDE),
+                "ts": t0
+            }
+            header_bytes = json.dumps(header).encode("utf-8")
+            header_len   = struct.pack("<I", len(header_bytes))
+            pad          = (4 - (len(header_bytes) & 3)) & 3
+            pad_bytes    = b"\x00" * pad
+
+            depth_bytes = d_norm.astype(np.float32, copy=False).tobytes(order="C")
+            rgb_bytes   = rgb.tobytes(order="C")
+            blob        = b"".join([header_len, header_bytes, pad_bytes, depth_bytes, rgb_bytes])
+
             await websocket.send(blob)
             send_count += 1
-        except Exception as e:
-            log.warning(f"websocket send failed: {e}")
+            frame_count += 1
+
+            if use_test_fallback and not TEST_PATTERN:
+                use_test_fallback = False  # probe back to real path
+
+            now = time.time()
+            if now - last_log_t >= LOG_EVERY_SEC:
+                size_kb = len(blob) / 1024.0
+                dmin = float(np.min(d_norm)) if d_norm.size else -1
+                dmax = float(np.max(d_norm)) if d_norm.size else -1
+                dmean = float(np.mean(d_norm)) if d_norm.size else -1
+                log.info(f"frames={frame_count} sent={send_count} | grid={ws}x{hs} N={ws*hs} | blob={size_kb:.1f} KB | depth[min/mean/max]={dmin:.3f}/{dmean:.3f}/{dmax:.3f}")
+                last_log_t = now
+
+            await asyncio.sleep(0)
+
+        except websockets.ConnectionClosed:
+            log.info("client disconnected: %s", peer)
             break
-
-        frame_count += 1
-        now = time.time()
-        if now - last_log_t >= LOG_EVERY_SEC:
-            size_kb = len(blob) / 1024.0
-            dmin = float(np.min(d_norm)) if d_norm.size else -1
-            dmax = float(np.max(d_norm)) if d_norm.size else -1
-            dmean = float(np.mean(d_norm)) if d_norm.size else -1
-            log.info(f"frames={frame_count} sent={send_count} | grid={ws}x{hs} N={ws*hs} | blob={size_kb:.1f} KB | depth[min/mean/max]={dmin:.3f}/{dmean:.3f}/{dmax:.3f}")
-            last_log_t = now
-
-        await asyncio.sleep(0)
+        except Exception as e:
+            log.exception("frame loop error (falling back to TEST_PATTERN): %r", e)
+            use_test_fallback = True
+            await asyncio.sleep(0.05)
 
 async def send_json(ws, obj):
     try:
@@ -272,7 +287,6 @@ async def control_loop(ws):
     """Consumer: handle JSON control messages."""
     async for msg in ws:
         if isinstance(msg, (bytes, bytearray)):
-            # ignore binary from client
             continue
         try:
             data = json.loads(msg)
@@ -289,9 +303,6 @@ async def control_loop(ws):
                 await send_json(ws, {"type":"set_cam_ok","index":idx})
             except Exception as e:
                 await send_json(ws, {"type":"set_cam_err","error":str(e)})
-        else:
-            # ignore unknown
-            pass
 
 async def handler(websocket):
     # hello (header length == 0)
@@ -316,7 +327,6 @@ def build_ssl_context():
         )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-    # Local dev: allow TLS 1.2+ defaults; SNI not required for localhost.
     return ctx
 
 async def main():
@@ -330,17 +340,17 @@ async def main():
     ssl_context = build_ssl_context()
     scheme = "wss" if ssl_context else "ws"
 
-    # Origin check is relaxed for localhost dev
-    async def origins(path, request_headers):
-        return True
-
     # IMPORTANT: pass ssl=ssl_context to enable WSS
     async with websockets.serve(
-        handler, BIND_HOST, PORT,
-        max_size=None, ping_interval=20,
+        handler,
+        BIND_HOST,
+        PORT,
+        max_size=None,
+        ping_interval=PING_INTERVAL,
+        ping_timeout=PING_TIMEOUT,
         ssl=ssl_context,
         process_request=None,
-        origins=None  # allow all (localhost dev)
+        origins=None  # allow all localhost/dev origins
     ):
         log.info(f"Streaming on {scheme}://{BIND_HOST}:{PORT} | TEST_PATTERN={int(TEST_PATTERN)} | stride={STRIDE} | cam_index={resolved_index} name='{WEBCAM_NAME}'")
         if ssl_context:
