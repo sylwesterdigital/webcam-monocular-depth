@@ -29,9 +29,10 @@ It runs locally, requires no cloud connection, and packages into a standalone `.
 - Python **3.10+** (tested with 3.13).
 - [Homebrew](https://brew.sh/) (to install `ffmpeg` and `mkcert`).
 - Dependencies (install inside a venv):
-  ```bash
+
+```
   pip install opencv-python torch torchvision torchaudio pillow websockets numpy timm pyobjc
-````
+```
 
 ---
 
@@ -39,7 +40,7 @@ It runs locally, requires no cloud connection, and packages into a standalone `.
 
 ### 1. Clone and set up environment
 
-```bash
+```
 git clone https://github.com/yourname/webcam-monocular-depth
 cd webcam-monocular-depth
 python3 -m venv .venv
@@ -49,7 +50,7 @@ pip install -r requirements.txt
 
 ### 2. Generate HTTPS certificates (first run only)
 
-```bash
+```
 cd client
 mkdir -p certs && cd certs
 brew install mkcert nss
@@ -61,13 +62,13 @@ mkcert localhost 127.0.0.1 ::1
 
 Use test pattern (no camera):
 
-```bash
+```
 ./test.sh
 ```
 
 Or use webcam:
 
-```bash
+```
 ./test.sh --camera
 ```
 
@@ -84,13 +85,13 @@ We use **PyInstaller** with a custom `LiveDepth.spec`.
 
 ### 1. Ensure you have pyinstaller
 
-```bash
+```
 pip install pyinstaller
 ```
 
 ### 2. Create app icon
 
-```bash
+```
 mkdir -p build/Icon.iconset assets
 sips -z 16 16     icon.png --out build/Icon.iconset/icon_16x16.png
 sips -z 32 32     icon.png --out build/Icon.iconset/icon_16x16@2x.png
@@ -151,8 +152,3 @@ Set via environment variables:
 
 © 2025 Sylwester Mielniczuk — WORKWORK.FUN LTD (UK).
 All rights reserved.
-
-```
-
----
-
