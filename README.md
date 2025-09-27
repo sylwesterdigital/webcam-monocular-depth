@@ -1,93 +1,156 @@
-Nice — the build **succeeded** 🎉 You’ve got a signed `.app` in `dist/LiveDepth.app`. Here’s exactly what to do next and how to hand it to other Mac users.
+# LiveDepth
 
-# 1) Quick local test
+LiveDepth is a **real-time monocular depth streaming app** for macOS.  
+It uses **PyTorch MiDaS models** to infer per-pixel depth from a webcam feed (or a synthetic test pattern), and streams results over **WebSockets** to a browser-based 3D viewer.  
 
-1. Open Finder → `dist/LiveDepth.app` → right-click → **Open** (first run bypasses Gatekeeper).
-2. When macOS asks for **Camera** permission, click **OK**.
-3. Your viewer should connect to the local server and show the point cloud.
+It runs locally, requires no cloud connection, and packages into a standalone `.app` with HTTPS UI and WSS data channel.
 
-   * Keyboard: `P` pause, `S` save PNG, `F` fullscreen, `1..4` rain modes, `G/Shift+G` GLB/GLTF export, `B` build-in, `D` dissolve, `R` reset.
+---
 
-If the app window stays blank or quits:
+## Features
 
-* Run it from Terminal to see logs:
+- Monocular depth estimation in real-time using MiDaS (`MiDaS_small`, `DPT_Hybrid`, or `DPT_Large`).
+- Camera feed (FaceTime HD, external USB, or virtual webcams) or synthetic test pattern.
+- Streams depth + RGB frames via **WebSocket**.
+- Local **HTTPS server** hosts the UI viewer.
+- Status-bar app bundle for macOS with:
+  - Open Viewer
+  - Restart Server
+  - About panel (with version/build metadata)
+  - Quit
 
+---
+
+## Requirements
+
+- **macOS 11.0+** (Apple Silicon recommended).
+- Python **3.10+** (tested with 3.13).
+- [Homebrew](https://brew.sh/) (to install `ffmpeg` and `mkcert`).
+- Dependencies (install inside a venv):
   ```bash
-  ./dist/LiveDepth.app/Contents/MacOS/LiveDepth
-  ```
-* Check **System Settings → Privacy & Security → Camera** and ensure “LiveDepth” is allowed.
-* If you get “address in use”, something is already on port 8765. Quit that app or change your server port and rebuild.
+  pip install opencv-python torch torchvision torchaudio pillow websockets numpy timm pyobjc
+````
 
-# 2) First-run model weights (important)
+---
 
-Your server uses `torch.hub.load("intel-isl/MiDaS", ...)`. On a *first* run, PyTorch may download the MiDaS repo/weights to `~/.cache/torch/hub`. Two options:
+## Running Locally (Source Tree)
 
-* **Simplest**: run the app once on a machine with internet so the weights cache populates. After that, it works offline.
-* **Portable/offline**: put the MiDaS repo & weights inside your app:
-
-  1. Pre-download MiDaS into your project (e.g. `weights/midas/…`) and modify your `server.py` to load locally (example):
-
-     ```python
-     REPO = os.path.join(os.path.dirname(__file__), "weights", "midas")
-     midas = torch.hub.load(REPO, MODEL_TYPE, source="local").to(device).eval()
-     ```
-  2. You already bundle `weights/` via the spec, so it’ll ship inside the `.app`. Rebuild.
-
-# 3) Share it with people
-
-The **fastest** way: zip the app.
+### 1. Clone and set up environment
 
 ```bash
-cd dist
-zip -r LiveDepth-macOS-arm64.zip LiveDepth.app
+git clone https://github.com/yourname/webcam-monocular-depth
+cd webcam-monocular-depth
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Send that zip. The recipient will:
-
-* Unzip → right-click **Open** (first run) → allow Camera.
-* If they get “unidentified developer”, right-click Open solves it.
-
-# 4) Optional: reduce size
-
-You’re pulling in a lot of PyTorch subpackages you don’t use (and torchaudio). Two easy trims:
-
-* Exclude torchaudio (and its libsox noise) in your spec:
-
-  ```python
-  excludes=['torchaudio', 'tensorflow']
-  ```
-
-  Then rebuild.
-
-* If you don’t use `torchvision`, remove its `collect_all()` and hidden-import entries.
-
-# 5) Optional: proper codesigning + notarization (no “Open anyway”)
-
-If you have an Apple Developer ID:
+### 2. Generate HTTPS certificates (first run only)
 
 ```bash
-# 5a) Ad-hoc sign (already done by PyInstaller, but you can re-sign)
-codesign --force --deep --options runtime --sign - "dist/LiveDepth.app"
-
-# 5b) Sign with your Developer ID cert
-codesign --force --deep --options runtime --sign "Developer ID Application: Your Name (TEAMID)" dist/LiveDepth.app
-
-# 5c) Notarize (App Store Connect creds or API key configured)
-xcrun notarytool submit dist/LiveDepth.app --keychain-profile "AC_PASSWORD" --wait
-xcrun stapler staple dist/LiveDepth.app
+cd client
+mkdir -p certs && cd certs
+brew install mkcert nss
+mkcert -install
+mkcert localhost 127.0.0.1 ::1
 ```
 
-After stapling, users can double-click with no warnings.
+### 3. Test run (without build)
 
-# 6) Troubleshooting you might hit
+Use test pattern (no camera):
 
-* **TensorBoard warning**: harmless (`No module named 'tensorboard'`). You’re not using it.
-* **Huge app size**: normal with PyTorch. Trim packages as in step 4.
-* **No camera feed**: wrong webcam index — set `WEBCAM_INDEX=0/1` in your code or add a small UI/Config file. Because double-click apps don’t read shell envs, read a `config.json` alongside `server.py` instead.
-* **MPS not used**: first time PyTorch MPS warms up slowly. Logs should still say `mps: True`. If you see CPU fallback, ensure macOS ≥ 13 and a Metal-capable Mac.
+```bash
+./test.sh
+```
 
-# 7) Smoke tests (quick)
+Or use webcam:
 
-* Launch, allow camera, confirm FPS in overlay.
-* Hit `G` to export a `.glb` and open it in Quick Look or Blender.
-* Toggle `TEST_PATTERN=1` in your code and rebuild if you want a demo without a camera.
+```bash
+./test.sh --camera
+```
+
+This launches:
+
+* HTTPS UI at [https://127.0.0.1:8443](https://127.0.0.1:8443)
+* WebSocket server at `ws(s)://127.0.0.1:8765/`
+
+---
+
+## Building macOS `.app`
+
+We use **PyInstaller** with a custom `LiveDepth.spec`.
+
+### 1. Ensure you have pyinstaller
+
+```bash
+pip install pyinstaller
+```
+
+### 2. Create app icon
+
+```bash
+mkdir -p build/Icon.iconset assets
+sips -z 16 16     icon.png --out build/Icon.iconset/icon_16x16.png
+sips -z 32 32     icon.png --out build/Icon.iconset/icon_16x16@2x.png
+sips -z 32 32     icon.png --out build/Icon.iconset/icon_32x32.png
+sips -z 64 64     icon.png --out build/Icon.iconset/icon_32x32@2x.png
+sips -z 128 128   icon.png --out build/Icon.iconset/icon_128x128.png
+sips -z 256 256   icon.png --out build/Icon.iconset/icon_128x128@2x.png
+sips -z 256 256   icon.png --out build/Icon.iconset/icon_256x256.png
+sips -z 512 512   icon.png --out build/Icon.iconset/icon_256x256@2x.png
+sips -z 512 512   icon.png --out build/Icon.iconset/icon_512x512.png
+sips -z 1024 1024 icon.png --out build/Icon.iconset/icon_512x512@2x.png
+iconutil -c icns build/Icon.iconset -o assets/LiveDepth.icns
+```
+
+### 3. Build
+
+```bash
+pyinstaller LiveDepth.spec --noconfirm
+```
+
+The result is in:
+
+```
+dist/LiveDepth.app
+```
+
+Move it to `/Applications` if desired.
+
+---
+
+## Usage
+
+* Launch `LiveDepth.app` from Finder.
+* A status-bar icon appears (`LiveDepth`).
+* Menu options:
+
+  * **About LiveDepth** — shows version/build info
+  * **Open Viewer** — opens the browser client
+  * **Restart Server** — restarts depth inference
+  * **Quit LiveDepth** — exits
+
+---
+
+## Configuration
+
+Set via environment variables:
+
+* `WEBCAM_INDEX=0` — select camera by index
+* `WEBCAM_NAME="FaceTime HD Camera"` — select camera by name (macOS/AVFoundation)
+* `MODEL_TYPE=MiDaS_small|DPT_Hybrid|DPT_Large`
+* `TEST_PATTERN=1` — use synthetic scene (for debugging)
+* `TARGET_WIDTH=640` — resize input width
+* `STRIDE=2` — subsample for performance/bandwidth
+
+---
+
+## License
+
+© 2025 Sylwester Mielniczuk — WORKWORK.FUN LTD (UK).
+All rights reserved.
+
+```
+
+---
+
