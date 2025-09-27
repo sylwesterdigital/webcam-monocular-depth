@@ -2,11 +2,26 @@
 # macOS / Python 3.10+ recommended
 # pip install opencv-python torch torchvision torchaudio pillow websockets numpy timm
 
-import asyncio, struct, json, time, os, logging, subprocess, sys, re, shutil, socket
+import asyncio, struct, json, time, os, logging, subprocess, sys, re, shutil, socket, ssl
 import cv2
 import numpy as np
 import torch
 import websockets
+
+# --- logging to file in ~/Library/Logs/LiveDepth ---
+from logging.handlers import RotatingFileHandler
+def _setup_file_logging():
+    logdir = os.path.expanduser("~/Library/Logs/LiveDepth")
+    os.makedirs(logdir, exist_ok=True)
+    logfile = os.path.join(logdir, "LiveDepth.log")
+    fh = RotatingFileHandler(logfile, maxBytes=5_000_000, backupCount=3)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
+    fh.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+    logging.getLogger().addHandler(fh)
+    logging.getLogger("depth-stream").info(f"log file: {logfile}")
+_setup_file_logging()
+
+
 
 # ------------------------ config ------------------------
 WEBCAM_INDEX = int(os.getenv("WEBCAM_INDEX", "0"))
@@ -15,16 +30,24 @@ TARGET_WIDTH = int(os.getenv("TARGET_WIDTH", "640"))
 STRIDE       = int(os.getenv("STRIDE", "2"))         # 1=full res; 2/3 reduces payload
 FOV_DEG      = float(os.getenv("FOV_DEG", "60.0"))
 PORT         = int(os.getenv("PORT", "8765"))
-BIND_HOST    = os.getenv("BIND_HOST", "127.0.0.1")   # force IPv4 to match ws://127.0.0.1
+BIND_HOST    = os.getenv("BIND_HOST", "127.0.0.1")   # keep IPv4 to match localhost
 MODEL_TYPE   = os.getenv("MODEL_TYPE", "MiDaS_small")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
 EMA_ALPHA    = float(os.getenv("EMA_ALPHA", "0.2"))
 CLAMP_NEAR   = float(os.getenv("CLAMP_NEAR", "0.2"))
 CLAMP_FAR    = float(os.getenv("CLAMP_FAR",  "4.0"))
 TEST_PATTERN = bool(int(os.getenv("TEST_PATTERN", "0")))  # 1 = synthetic pattern
 LOG_EVERY_SEC= float(os.getenv("LOG_EVERY_SEC", "2.0"))
+LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# TLS
+USE_TLS          = int(os.getenv("USE_TLS", "1"))     # 1 = WSS (default), 0 = WS
+HTTPS_CERT_PATH  = os.getenv("HTTPS_CERT_PATH", "certs/localhost+2.pem")
+HTTPS_KEY_PATH   = os.getenv("HTTPS_KEY_PATH",  "certs/localhost+2-key.pem")
 # --------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%H:%M:%S")
 log = logging.getLogger("depth-stream")
 
 device = torch.device("mps" if torch.backends.mps.is_available() else
@@ -54,7 +77,7 @@ def make_test_pattern(t, w, h):
     r = (0.5 + 0.5 * np.sin(6.28 * xx + t)).astype(np.float32)
     g = (0.5 + 0.5 * np.sin(6.28 * yy + t*1.3)).astype(np.float32)
     b = (0.5 + 0.5 * np.sin(6.28 * (xx+yy) + t*0.9)).astype(np.float32)
-    rgb = np.stack([r, g, b], axis=-1)  # h,w,3
+    rgb = np.stack([r, g, b], axis=-1)
     rgb = (rgb * 255).astype(np.uint8).reshape(-1,3)
     return Z, rgb
 
@@ -144,7 +167,10 @@ def open_camera(index: int):
 
 if not TEST_PATTERN:
     resolved_index = resolve_webcam_index(WEBCAM_NAME, WEBCAM_INDEX)
-    open_camera(resolved_index)
+    try:
+        open_camera(resolved_index)
+    except Exception as e:
+        log.error("Camera open failed: %r", e)
 
 ema_depth = None
 frame_count = 0
@@ -154,7 +180,8 @@ last_log_t = time.time()
 async def frame_stream(websocket):
     """Producer: stream frames to the connected client."""
     global ema_depth, frame_count, send_count, last_log_t
-    log.info("client connected; starting stream loop")
+    peer = getattr(websocket, "remote_address", None)
+    log.info("client connected: %s", peer)
 
     while True:
         t0 = time.time()
@@ -166,6 +193,9 @@ async def frame_stream(websocket):
             hs, ws = d_norm.shape[:2]
             fx, fy, cx, cy = intrinsics(ws, hs, FOV_DEG)
         else:
+            if cap is None:
+                await asyncio.sleep(0.03)
+                continue
             ok, frame = cap.read()
             if not ok:
                 await asyncio.sleep(0.01)
@@ -272,6 +302,23 @@ async def handler(websocket):
     for task in pending:
         task.cancel()
 
+def build_ssl_context():
+    """Return SSL context if USE_TLS=1; otherwise None."""
+    if not USE_TLS:
+        log.warning("TLS disabled (USE_TLS=0) — serving plain ws://")
+        return None
+    cert_file = HTTPS_CERT_PATH
+    key_file  = HTTPS_KEY_PATH
+    if not (os.path.exists(cert_file) and os.path.exists(key_file)):
+        raise FileNotFoundError(
+            f"TLS enabled but cert/key not found:\n  cert={cert_file}\n  key={key_file}\n"
+            f"Set HTTPS_CERT_PATH / HTTPS_KEY_PATH or USE_TLS=0."
+        )
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    # Local dev: allow TLS 1.2+ defaults; SNI not required for localhost.
+    return ctx
+
 async def main():
     # Ensure bind host is reachable (helpful log)
     try:
@@ -280,8 +327,25 @@ async def main():
     except Exception:
         log.warning(f"BIND_HOST '{BIND_HOST}' may not be reachable")
 
-    async with websockets.serve(handler, BIND_HOST, PORT, max_size=None, ping_interval=20):
-        log.info(f"Streaming on ws://{BIND_HOST}:{PORT} | TEST_PATTERN={int(TEST_PATTERN)} | stride={STRIDE} | cam_index={resolved_index} name='{WEBCAM_NAME}'")
+    ssl_context = build_ssl_context()
+    scheme = "wss" if ssl_context else "ws"
+
+    # Origin check is relaxed for localhost dev
+    async def origins(path, request_headers):
+        return True
+
+    # IMPORTANT: pass ssl=ssl_context to enable WSS
+    async with websockets.serve(
+        handler, BIND_HOST, PORT,
+        max_size=None, ping_interval=20,
+        ssl=ssl_context,
+        process_request=None,
+        origins=None  # allow all (localhost dev)
+    ):
+        log.info(f"Streaming on {scheme}://{BIND_HOST}:{PORT} | TEST_PATTERN={int(TEST_PATTERN)} | stride={STRIDE} | cam_index={resolved_index} name='{WEBCAM_NAME}'")
+        if ssl_context:
+            log.info(f"TLS cert: {HTTPS_CERT_PATH}")
+            log.info(f"TLS key : {HTTPS_KEY_PATH}")
         await asyncio.Future()
 
 if __name__ == "__main__":

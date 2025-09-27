@@ -2,10 +2,26 @@
 import os, sys, time, socket, threading, webbrowser, asyncio, ssl, http.server, socketserver
 from pathlib import Path
 
+# --- capture app-level stdout/stderr into same log file ---
+def _redirect_stdio_to_log():
+    logdir = os.path.expanduser("~/Library/Logs/LiveDepth")
+    os.makedirs(logdir, exist_ok=True)
+    logfile = os.path.join(logdir, "LiveDepth.log")
+    f = open(logfile, "a", buffering=1)
+    sys.stdout = f
+    sys.stderr = f
+    print("[LiveDepth] stdio ->", logfile)
+_redirect_stdio_to_log()
+
+
 HTTPS_PORT = int(os.getenv("HTTPS_PORT", "8443"))
-WSS_PORT   = int(os.getenv("PORT", "8766"))  # keep in sync with server.py
+WSS_PORT   = int(os.getenv("PORT", "8765"))  # keep in sync with server.py
 CERT_PATH  = os.getenv("HTTPS_CERT_PATH", "certs/localhost+2.pem")
 KEY_PATH   = os.getenv("HTTPS_KEY_PATH",  "certs/localhost+2-key.pem")
+
+# Optional: version strings (set by build script or spec); used by About panel
+APP_VERSION  = os.getenv("APP_VERSION", "0.1.0")   # marketing version
+BUILD_NUMBER = os.getenv("BUILD_NUMBER", "1")      # build number (integer-like)
 
 # ---- Paths inside PyInstaller bundle or source tree ----
 BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -61,11 +77,19 @@ from Cocoa import (
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory,
     NSStatusBar, NSMenu, NSMenuItem, NSVariableStatusItemLength
 )
+# About panel options live in AppKit; import the constants explicitly
+from AppKit import (
+    NSAboutPanelOptionApplicationName,
+    NSAboutPanelOptionApplicationVersion,
+    NSAboutPanelOptionVersion,
+    NSAboutPanelOptionCredits,
+)
 import PyObjCTools.AppHelper as AppHelper
-from Foundation import NSObject
+from Foundation import NSObject, NSDictionary, NSAttributedString
 
 class AppDelegate(NSObject):
     def openViewer_(self, _): _open_browser()
+
     def restartServer_(self, _):
         global _wss_thread
         try:
@@ -73,6 +97,23 @@ class AppDelegate(NSObject):
             _wss_thread.start()
         except Exception as e:
             print("[LiveDepth] restart failed:", e, file=sys.stderr)
+
+    # --- About panel handler (shows standard macOS About window) ---
+    def about_(self, _):
+        # credits can be plain or attributed text
+        credits = NSAttributedString.alloc().initWithString_(
+            "LiveDepth — Monocular depth streaming demo\n"
+            "© 2025 Sylwester Mielniczuk — WORKWORK.FUN LTD (UK)"
+        )
+        opts = {
+            NSAboutPanelOptionApplicationName: "LiveDepth",
+            NSAboutPanelOptionApplicationVersion: APP_VERSION,   # big version text
+            NSAboutPanelOptionVersion: f"Build {BUILD_NUMBER}",  # small line under it
+            NSAboutPanelOptionCredits: credits,
+        }
+        NSApp.activateIgnoringOtherApps_(True)
+        NSApp.orderFrontStandardAboutPanelWithOptions_(NSDictionary.dictionaryWithDictionary_(opts))
+
     def quit_(self, _): os._exit(0)
 
 def _run_statusbar_ui():
@@ -84,6 +125,10 @@ def _run_statusbar_ui():
     item.button().setTitle_("LiveDepth")
     menu = NSMenu.alloc().init()
     delegate = AppDelegate.alloc().init()
+
+    # --- About menu item (opens standard About panel) ---
+    mi_about = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("About LiveDepth", "about:", "")
+    mi_about.setTarget_(delegate); menu.addItem_(mi_about)
 
     mi_open = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Open Viewer", "openViewer:", "")
     mi_open.setTarget_(delegate); menu.addItem_(mi_open)
