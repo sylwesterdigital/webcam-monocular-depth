@@ -2,21 +2,69 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Live Depth Point Cloud + Rain Collisions</title>
+  <title>Live Depth Point Cloud + Rain Collisions + WebXR</title>
   <link rel="icon" href="data:,">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
   <style>
     html,body { margin:0; height:100%; overflow:hidden; background:#000; }
-    #overlay { position:fixed; top:12px; left:120px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.4); padding:8px 10px; border-radius:8px; }
-    #overlay.error { color:#ff5555; } /* red when disconnected */
-    #bars { position:fixed;  bottom:12px; left:12px; display:flex; gap:8px; }
+    #overlay { position:fixed; top:12px; left:120px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.4); padding:8px 10px; border-radius:8px; z-index:15; }
+    #overlay.error { color:#ff5555; }
+
+    /* Existing camera bars */
+    #bars { position:fixed; bottom:12px; left:12px; display:flex; gap:8px; z-index:10; }
     .bar { background:rgba(0,0,0,.65); color:#0f0; font:12px/1.4 monospace; padding:8px 10px; border-radius:8px; display:flex; gap:6px; align-items:center; }
     .bar label { opacity:.85; }
     .bar select, .bar button {
-      background:#111; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:3px 6px; font:12px/1.2 monospace;
+      background:#111; color:#0f0; border:1px dotted; #0f0; border-radius:6px; padding:3px 6px; font:12px/1.2 monospace;
     }
+    .bar select, .bar button:hover {
+      background:#111; color:#0f0; border:1px solid; #0f0; border-radius:6px; padding:3px 6px; font:12px/1.2 monospace;
+    }
+
+
     .muted { opacity:.45; pointer-events:none; }
+
+    /* NEW: on-screen action buttons that mirror keyboard shortcuts */
+    #actions { position:fixed; bottom:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; z-index:12; }
+    #actions .bar { gap:6px; }
+
+    /* Larger touch targets on mobile */
+    @media (hover:none) and (pointer:coarse) {
+      .bar select, .bar button { padding:8px 10px; font-size:14px; }
+    }
+
+    /* Portrait/mobile: stack and lift camera bars so they don't collide with XR button */
+    @media (max-aspect-ratio: 1/1) {
+      #bars { flex-direction:column; bottom:88px; left:12px; right:auto; }
+      #overlay { left:12px; }
+      #actions { top:auto; bottom:12px; right:12px; }
+    }
+
+    #dropHint {
+      position: fixed; inset: 0;
+      display: none; place-items: center;
+      background: rgba(0,0,0,.35);
+      color: #0f0; font: 16px/1.4 monospace;
+      z-index: 9999;
+    }
+    #dropHint.show { display: grid; }
+
+
   </style>
+
   <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+
+
+<!--   <script type="importmap">
     {
       "imports": {
         "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
@@ -24,10 +72,38 @@
         "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.18/dist/lil-gui.esm.min.js"
       }
     }
-  </script>
+  </script> -->
+
+
 </head>
 <body>
   <div id="overlay">connecting…</div>
+  <!-- Model loader UI -->
+  <input id="fileInput" type="file" accept=".glb,.gltf" multiple style="display:none">
+
+  <input id="presetFile" type="file" accept=".json" style="display:none">
+
+  <div id="dropHint" style="display:none;">Drop .glb / .gltf files to load</div>
+
+
+  <!-- NEW: Action buttons -->
+  <div id="actions">
+    <div class="bar">
+      <button id="btnPause" title="[P] Pause/Resume">⏸</button>
+      <button id="btnSave" title="[S] Save">Save</button>
+      <button id="btnFull" title="[F] FScreen">⛶</button>
+      <button id="btnBuild" title="[B] Build">▣</button>
+      <button id="btnDissolve" title="[D] Dissolve">✹</button>
+      <button id="btnReset" title="[R] Reset">↺</button>
+      <button id="btnFilter" title="[T] Cycle">🎨</button>
+      <button data-mode="1" class="btnMode" title="[1] Stick">1</button>
+      <button data-mode="2" class="btnMode" title="[2] Fly-up">2</button>
+      <button data-mode="3" class="btnMode" title="[3] Radial">3</button>
+      <button data-mode="4" class="btnMode" title="[4] Random">4</button>
+      <button id="btnLoad" title="Load GLB/GLTF">Load</button>
+    </div>
+  </div>
+
   <div id="bars">
     <div class="bar" id="browserBar">
       <label for="camSelect">Browser cam:</label>
@@ -45,7 +121,23 @@
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
     import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+
+    // --- ADD WITH OTHER IMPORTS (near OrbitControls/Exporter) ---
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+    import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+    
+    import { TransformControls } from "three/addons/controls/TransformControls.js";
+
+
     import { GUI } from "lil-gui";
+    import { XRButton } from "three/addons/webxr/XRButton.js";
+    import { ARButton } from "three/addons/webxr/ARButton.js";
+    import { XRControllerModelFactory } from "three/addons/webxr/XRControllerModelFactory.js";
+    import { XRHandModelFactory }     from "three/addons/webxr/XRHandModelFactory.js"; 
+
+
+
+
 
     // ---------- UI refs ----------
     const overlay   = document.getElementById("overlay");
@@ -56,9 +148,27 @@
     const srvSelect = document.getElementById("srvSelect");
     const srvRefresh= document.getElementById("srvRefresh");
 
+    // NEW: action buttons
+    const btnPause = document.getElementById('btnPause');
+    const btnSave  = document.getElementById('btnSave');
+    const btnFull  = document.getElementById('btnFull');
+    const btnBuild = document.getElementById('btnBuild');
+    const btnDissolve = document.getElementById('btnDissolve');
+    const btnReset = document.getElementById('btnReset');
+    const btnFilter= document.getElementById('btnFilter');
+    const btnModeEls = Array.from(document.querySelectorAll('.btnMode'));
+
     let statusText = "connecting…";
     let paused = false;
     let lastHeader = null;
+
+
+    let _dbPromise = null;
+    // --- PERSISTENCE: IndexedDB (presets) + localStorage (autosave) ---
+    const DB_NAME = "LiveDepthViewerDB";
+    const DB_VERSION = 1;
+    const STORE = "presets";        
+
 
     // ---------- Scene ----------
     const scene = new THREE.Scene();
@@ -67,13 +177,36 @@
     const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
     camera.position.set(0, 0, 2);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha:true });
     renderer.setPixelRatio(devicePixelRatio);
     renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true;
     document.body.appendChild(renderer.domElement);
 
+    console.log('THREE revision:', THREE.REVISION);
+    console.log('TransformControls instanceof Object3D?', (new TransformControls(camera, renderer.domElement)) instanceof THREE.Object3D);
+
+    // Orbit controls (disabled during XR sessions)
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
+
+    // A group that holds *everything* we want to position/scale in XR
+    const cloudGroup = new THREE.Group();
+    scene.add(cloudGroup);
+
+    // Floor for VR (hidden in AR)
+    const floorSize = 8, floorDiv = 32;
+    const floorGrid = new THREE.GridHelper(floorSize, floorDiv, 0x224422, 0x112211);
+    floorGrid.position.y = -1.6;
+    floorGrid.visible = true;
+    scene.add(floorGrid);
+
+    // Subtle lighting
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(1,1,1);
+    scene.add(dirLight, new THREE.AmbientLight(0xffffff, 0.2));
 
     // ---------- Transitions ----------
     const TRANSITION = { NORMAL:0, BUILD:1, DISSOLVE:2 };
@@ -86,15 +219,53 @@
     const SOURCE  = { PythonWS: "Python (WS)", BrowserCam: "Browser Webcam" };
 
     const params = {
+
       source: SOURCE.PythonWS,
       filter: FILTERS.None, hue: 0, tintAmount: 0.55, brightness: 1.0, contrast: 1.0,
       clamp: true, bwEnabled: false, bwThreshold: 0.5,
       pointSize: 0.010, pointShape: "square", shapeFeather: 1.25, crossThickness: 0.22,
       rainSpeed: 1.0,
-      camWidth: 320, camStride: 2, camDepthScale: 1.6, camDepthOffset: 0.4, camFlipX: false, camFlipY: false
+      camWidth: 320, camStride: 2, camDepthScale: 1.6, camDepthOffset: 0.4, camFlipX: false, camFlipY: false,
+
+      // XR placement tuning
+      xrScale: 0.22,           // smaller in XR
+      xrDistance: 1.0,         // ~1m in front
+      xrYOffset: -0.4,         // a bit below head level
+      xrPointPixelSize: 0.02,   // ~2mm screen-space in AR
+
+      rainCount: 1200,       // total drops
+      rainSize: 0.002,       // PointsMaterial.size
+
+      tweenAuto: true,        // auto: follow incoming frame cadence
+      tweenMs: 120,           // manual tween duration (ms) when tweenAuto = false
+      tweenMinMs: 40,         // clamps for auto
+      tweenMaxMs: 300,
+      tweenAlpha: 0.25,       // EMA factor for auto (0..1) higher = faster reaction
+      tweenEasing: "linear",  // "linear","easeIn","easeOut","easeInOut","smoothstep","smootherstep"
+
     };
 
+
+      // Depth fade (view-space Z)
+    Object.assign(params, {
+      fadeEnabled: true,
+        fadeStart: 0.8,   // meters from camera where fade begins
+        fadeEnd:   2.0,   // meters where points are fully gone
+        fadeDither: true  // stochastic screen-door to avoid sorting artifacts
+      });
+
+
+    Object.assign(params, {
+      serverEmaAlpha: 0.2,
+      serverClampNear: 0.2,
+      serverClampFar: 1.0
+    });
+
+
+
     const gui = new GUI();
+
+
     const gColor = gui.addFolder("Color");
     gColor.add(params, "filter", FILTERS).name("Mode").onChange(reapplyFilter);
     gColor.add(params, "hue", 0, 360, 1).name("Hue Rotation").onChange(reapplyFilter);
@@ -116,6 +287,14 @@
     gPoints.add(params, "crossThickness", 0.05, 0.5, 0.005).name("Cross Thickness").onChange(setPointShape);
     gPoints.open();
 
+
+    const gFade = gui.addFolder("Depth Fade");
+    gFade.add(params, "fadeEnabled").name("Enabled").onChange(()=>updateDepthFadeAll());
+    gFade.add(params, "fadeStart", 0.0, 5.0, 0.01).name("Start (m)").onChange(()=>updateDepthFadeAll());
+    gFade.add(params, "fadeEnd",   0.0, 5.0, 0.01).name("End (m)").onChange(()=>updateDepthFadeAll());
+    gFade.add(params, "fadeDither").name("Dither").onChange(()=>updateDepthFadeAll());
+
+
     const gSource = gui.addFolder("Source");
     gSource.add(params, "source", [SOURCE.PythonWS, SOURCE.BrowserCam]).name("Input").onChange(onSourceChanged);
     const gWebcam = gSource.addFolder("Webcam (synthetic depth)");
@@ -127,49 +306,740 @@
     gWebcam.add(params, "camFlipY").name("Flip Y");
     gSource.open();
 
-    // ---------- Cloud ----------
-    const cloudMaterial = new THREE.PointsMaterial({ size: params.pointSize, vertexColors: true, sizeAttenuation: true });
-    const cloudGeom = new THREE.BufferGeometry();
-    scene.add(new THREE.Points(cloudGeom, cloudMaterial));
 
-    let lastPos=null, nextPos=null, curPos=null, curCol=null, baseCol=null;
-    let tweenT = 1, targetTweenMs = 120, lastArrival = performance.now();
+    let _pushTimer = 0;
+    function pushServerParams(){
+      if (!wsConnected || !ws) return;
+      clearTimeout(_pushTimer);
+      _pushTimer = setTimeout(()=>{
+        try {
+          const near = Math.min(params.serverClampNear, params.serverClampFar - 1e-3);
+          const far  = Math.max(params.serverClampFar,  near + 1e-3);
+          ws.send(JSON.stringify({
+            cmd: "set_params",
+            ema_alpha: params.serverEmaAlpha,
+            clamp_near: near,
+            clamp_far: far
+          }));
+        } catch(e){}
+      }, 120);
+    }
+
+    const gServer = gui.addFolder("Server Depth (live)");
+    gServer.add(params, "serverEmaAlpha", 0, 1, 0.01).name("EMA α").onChange(pushServerParams);
+    gServer.add(params, "serverClampNear", 0.0, 3.0, 0.01).name("Clamp Near").onChange(pushServerParams);
+    gServer.add(params, "serverClampFar",  0.01, 5.0, 0.01).name("Clamp Far").onChange(pushServerParams);
+
+
+    // --- Rain GUI ---
+    const gRain = gui.addFolder("Rain");
+
+    // Speed (scales existing velocities so it feels immediate)
+    gRain.add(params, "rainSpeed", 0.1, 4.0, 0.01).name("Speed")
+    .onChange(v => {
+      if (!rainVX) return;
+      const prev = gRain.__prevSpeed || 1;
+      const scale = v / prev;
+      for (let i=0;i<rainVX.length;i++){
+        rainVX[i] *= scale; rainVY[i] *= scale; rainVZ[i] *= scale;
+      }
+      gRain.__prevSpeed = v;
+    });
+
+// Count (rebuild buffers)
+    gRain.add(params, "rainCount", 0, 10000, 100).name("Count")
+    .onChange(v => rebuildRain(v|0));
+
+// Size (update material)
+    gRain.add(params, "rainSize", 0.0005, 0.02, 0.0005).name("Drop Size")
+    .onChange(v => { if (rainMat){ rainMat.size = v; rainMat.needsUpdate = true; } });
+
+    gRain.open();
+
+
+    // --- Smooth GUI ---
+
+    function ease01(t, mode){
+      t = Math.max(0, Math.min(1, t));
+      switch (mode){
+      case "easeIn":        return t*t*t;
+      case "easeOut":       { const u=1-t; return 1-u*u*u; }
+      case "easeInOut":     { if (t<0.5) return 4*t*t*t; const u=2*t-2; return 0.5*u*u*u+1; }
+      case "smoothstep":    return t*t*(3-2*t);
+      case "smootherstep":  return t*t*t*(t*(6*t-15)+10);
+    default:              return t; // linear
+    }
+  }
+
+
+  const gSmooth = gui.addFolder("Smoothing");
+  gSmooth.add(params, "tweenAuto").name("Auto smoothing");
+  gSmooth.add(params, "tweenMs", 10, 800, 1).name("Manual τ (ms)")
+  .onChange(v => { if (!params.tweenAuto) tauMs = (v|0); });
+  gSmooth.add(params, "tweenMinMs", 10, 800, 1).name("Auto min τ");
+  gSmooth.add(params, "tweenMaxMs", 30, 1000, 1).name("Auto max τ");
+  gSmooth.add(params, "tweenAlpha", 0.05, 0.8, 0.01).name("Auto EMA α");
+// We ignore tweenEasing for live smoothing; keep it for BUILD transitions if you want:
+  gSmooth.add(params, "tweenEasing", ["linear","easeIn","easeOut","easeInOut","smoothstep","smootherstep"])
+  .name("Build easing");
+  gSmooth.open();
+
+
+
+
+
+  const gXR = gui.addFolder("XR Placement");
+  gXR.add(params, "xrScale", 0.05, 1.0, 0.01).name("Scale");
+  gXR.add(params, "xrDistance", 0.4, 3.0, 0.05).name("Distance");
+  gXR.add(params, "xrYOffset", -1.0, 1.0, 0.02).name("Y Offset");
+  gXR.add(params, "xrPointPixelSize", 0.005, 0.05, 0.001).name("AR Point px");
+
+
+
+// --- PRESETS GUI -------------------------------------------------------------
+  const presetFile = document.getElementById("presetFile");
+
+  const presetState = {
+    selected: "",
+    nameToSave: "",
+  };
+
+  const gPresets = gui.addFolder("Presets");
+
+// We'll recreate this controller whenever the list changes
+  let presetCtrl = null;
+
+  function buildPresetController(names) {
+  // Destroy old controller safely (lil-gui API)
+    if (presetCtrl) {
+      presetCtrl.destroy();
+      presetCtrl = null;
+    }
+
+  // Map array -> options object { "name":"name", ... } for a select control
+    const opts = names.reduce((acc, n) => (acc[n] = n, acc), {});
+    presetCtrl = gPresets.add(presetState, "selected", opts).name("Select");
+
+  // Auto-load on change
+    presetCtrl.onChange(async (name) => {
+      if (!name) return;
+      const st = await idbGetPreset(name);
+      if (st) {
+        applyState(st);
+        scheduleAutosave();
+      }
+    });
+  }
+
+  gPresets.add(presetState, "nameToSave").name("Name");
+
+  const refreshPresetList = async () => {
+    const list  = await idbListPresets();
+    const names = list.map(p => p.name).sort((a, b) => a.localeCompare(b));
+
+  // keep selection if possible
+    if (!names.includes(presetState.selected)) {
+      presetState.selected = names[0] || "";
+    }
+
+  // Rebuild the controller with the new options (avoids NotFoundError)
+    buildPresetController(names);
+  };
+
+  gPresets.add({ Save: async () => {
+    const name = (presetState.nameToSave || presetState.selected || "").trim();
+    if (!name) { alert("Enter a preset name."); return; }
+    await idbPutPreset(name, currentState());
+    presetState.selected   = name;
+    presetState.nameToSave = "";
+    await refreshPresetList();
+  }}, "Save");
+
+  gPresets.add({ Load: async () => {
+    if (!presetState.selected) { alert("Choose a preset."); return; }
+    const st = await idbGetPreset(presetState.selected);
+    if (!st) { alert("Preset missing."); return; }
+    applyState(st);
+    scheduleAutosave();
+  }}, "Load");
+
+  gPresets.add({ Delete: async () => {
+    if (!presetState.selected) { alert("Choose a preset."); return; }
+    if (!confirm(`Delete preset "${presetState.selected}"?`)) return;
+    await idbDeletePreset(presetState.selected);
+    presetState.selected = "";
+    await refreshPresetList();
+  }}, "Delete");
+
+  gPresets.add({ Export: () => {
+    const name = presetState.selected || presetState.nameToSave || "preset";
+    const blob = new Blob([ JSON.stringify(currentState(), null, 2) ], { type:"application/json" });
+    saveBlob(blob, `${name.replace(/[^\w.-]+/g,'_')}.json`);
+  }}, "Export");
+
+  gPresets.add({ Import: () => presetFile?.click() }, "Import");
+
+// Handle Import file select (unchanged)
+  presetFile?.addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      const st  = JSON.parse(txt);
+      let name  = prompt("Preset name to save as:", (st?.presetName || f.name.replace(/\.json$/i,'') || "Imported"));
+      if (!name) return;
+      await idbPutPreset(name, st);
+      presetState.selected = name;
+      await refreshPresetList();
+      applyState(st);
+      scheduleAutosave();
+    } catch (err) {
+      alert("Import failed: " + (err?.message || err));
+    } finally {
+      e.target.value = "";
+    }
+  });
+
+// initial list
+  refreshPresetList();
+  gPresets.open();
+
+
+
+
+
+// --- STATE: capture/apply ----------------------------------------------------
+  function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
+
+  function currentState(){
+  // What we persist:
+  // - camera & orbit target
+  // - all tweakable params (including server* + rain + smoothing + XR placement + color/points/fade)
+  // - selection of source, current browser cam id, server cam index (UI reads it)
+  // - external model transforms (by id & name) but NOT heavy geometry
+    const models = externalGroups.map(g => ({
+      id: g.id, name: g.name, visible: g.visible, density: g.density,
+      t: { x:g.group.position.x, y:g.group.position.y, z:g.group.position.z },
+      r: { x:g.group.rotation.x, y:g.group.rotation.y, z:g.group.rotation.z },
+      s: g.group.scale.x
+    }));
+    return {
+      version: 1,
+      camera: {
+        position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+        target:   { x: controls.target.x, y: controls.target.y, z: controls.target.z },
+        fov: camera.fov,
+      },
+      ui: {
+        source: params.source,
+        browserCamId: currentCamId || "",
+        serverSelectedIndex: srvSelect?.value ?? null,
+      },
+      params: clone(params),
+      models
+    };
+  }
+
+  function applyState(state, { silent = false } = {}) {
+    try {
+      if (!state) return;
+
+    // --- Camera + orbit target ---
+      if (state.camera) {
+        const p = state.camera.position || {};
+        const t = state.camera.target   || {};
+        if (Number.isFinite(p.x)) camera.position.set(p.x, p.y, p.z);
+        if (Number.isFinite(t.x)) controls.target.set(t.x, t.y, t.z);
+        if (Number.isFinite(state.camera.fov)) {
+          camera.fov = state.camera.fov;
+          camera.updateProjectionMatrix();
+        }
+        controls.update();
+      }
+
+    // --- Params (only keys that exist) ---
+      if (state.params) {
+        Object.keys(state.params).forEach(k => {
+          if (k in params) params[k] = state.params[k];
+        });
+
+// Refresh materials / uniforms / GUI displays
+        setPointShape();
+        updateDepthFadeAll();
+        try { gui.controllersRecursive?.forEach?.(c => c.updateDisplay?.()); } catch {}
+        try { gServer?.controllers?.forEach?.(c => c.updateDisplay?.()); } catch {}
+
+// Make sure the point size from the preset applies immediately
+        cloudMaterial.size = params.pointSize;
+        cloudMaterial.needsUpdate = true;
+
+// Keep external point clouds in sync with current params
+        updateExternalPointMaterials();
+
+
+      // If server parameters were restored, send them up
+        pushServerParams();
+
+      // --- APPLY RAIN SETTINGS FROM PRESET ---
+        (()=>{
+        // 1) Count → ensure buffers match
+          const wantCount = (params.rainCount | 0);
+          if (!rainVX || rainVX.length !== wantCount) {
+            rebuildRain(wantCount);
+          }
+
+        // 2) Size → update material
+          if (rainMat) {
+            rainMat.size = params.rainSize;
+            rainMat.needsUpdate = true;
+          }
+
+        // 3) Speed → scale existing velocities so it takes effect immediately
+          if (rainVX && typeof params.rainSpeed === "number") {
+            const prev = (gRain && gRain.__prevSpeed) ? gRain.__prevSpeed : 1;
+            if (prev > 0 && prev !== params.rainSpeed) {
+              const scale = params.rainSpeed / prev;
+              for (let i = 0; i < rainVX.length; i++) {
+                rainVX[i] *= scale; rainVY[i] *= scale; rainVZ[i] *= scale;
+              }
+            }
+            if (gRain) gRain.__prevSpeed = params.rainSpeed;
+          }
+        })();
+      // --- END RAIN SETTINGS ---
+      }
+
+    // --- Source & cameras ---
+      if (state.ui) {
+        if (state.ui.source) { params.source = state.ui.source; setBarsState(); }
+        if (state.ui.browserCamId) { currentCamId = state.ui.browserCamId; }
+
+        if (params.source === SOURCE.PythonWS) startWSStream();
+        else startWebcamStream(currentCamId);
+
+        if (wsConnected && state.ui.serverSelectedIndex != null) {
+          try { ws.send(JSON.stringify({ cmd: "set_cam", index: Number(state.ui.serverSelectedIndex) })); } catch {}
+        }
+      }
+
+    // --- External model transforms (best-effort by id, fallback by name) ---
+      if (Array.isArray(state.models)) {
+        state.models.forEach(m => {
+          const rec = externalGroups.find(g => g.id === m.id) ||
+          externalGroups.find(g => g.name === m.name);
+          if (!rec) return;
+          rec.group.position.set(m.t.x, m.t.y, m.t.z);
+          rec.group.rotation.set(m.r.x, m.r.y, m.r.z);
+          rec.group.scale.setScalar(m.s);
+          rec.visible = !!m.visible;
+          rec.group.visible = rec.visible;
+          if (typeof m.density === "number") resampleGroupDensity(rec, m.density);
+        });
+        rebuildGroupsGUI();
+        updateExternalPointMaterials();
+      }
+
+      if (!silent && paused) renderer.render(scene, camera);
+    } catch (e) {
+      console.warn("[state] applyState failed", e);
+    }
+  }
+
+
+
+
+
+
+  function getDB(){
+    if (_dbPromise) return _dbPromise;
+    _dbPromise = new Promise((resolve, reject)=>{
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE)){
+          db.createObjectStore(STORE, { keyPath: "name" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    });
+    return _dbPromise;
+  }
+
+  async function idbPutPreset(name, state){
+    const db = await getDB();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put({ name, state, ts: Date.now() });
+      tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
+    });
+  }
+  async function idbGetPreset(name){
+    const db = await getDB();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).get(name);
+      req.onsuccess = ()=> resolve(req.result?.state || null);
+      req.onerror   = ()=> reject(req.error);
+    });
+  }
+  async function idbDeletePreset(name){
+    const db = await getDB();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(name);
+      tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
+    });
+  }
+  async function idbListPresets(){
+    const db = await getDB();
+    return new Promise((resolve,reject)=>{
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = ()=> resolve((req.result || []).map(r => ({name:r.name, ts:r.ts})));
+      req.onerror   = ()=> reject(req.error);
+    });
+  }
+
+// Local autosave
+  const LS_LAST = "ld_last_state";
+  let _autosaveTimer = 0;
+  function scheduleAutosave(){
+    clearTimeout(_autosaveTimer);
+    _autosaveTimer = setTimeout(()=>{
+      try { localStorage.setItem(LS_LAST, JSON.stringify(currentState())); }
+      catch(e){ console.warn("[autosave] failed", e); }
+    }, 250);
+  }
+  function tryLoadAutosave(){
+    try{
+      const raw = localStorage.getItem(LS_LAST);
+      if (raw) applyState(JSON.parse(raw), {silent:true});
+    } catch(e){ console.warn("[autosave] load failed", e); }
+  }
+
+
+
+// Any GUI change or camera move => autosave
+  gui.onChange(() => { scheduleAutosave(); });
+  controls.addEventListener("change", scheduleAutosave);
+  window.addEventListener("beforeunload", scheduleAutosave);
+
+
+
+
+
+
+  // Smooth alpha fade - WIP
+
+
+  function attachDepthFadeToPointsMaterial(mat){
+  // uniforms live on userData so we can tweak from GUI
+    const uniforms = mat.userData.depthFadeUniforms || {
+      uFadeStart: { value: params.fadeStart },
+      uFadeEnd:   { value: params.fadeEnd },
+      uEnabled:   { value: params.fadeEnabled ? 1 : 0 },
+      uDither:    { value: params.fadeDither ? 1 : 0 }
+    };
+    mat.userData.depthFadeUniforms = uniforms;
+
+  mat.transparent = true;            // needed for smooth alpha fade
+  // keep your existing alphaTest logic for sprite shapes; it plays fine with dither
+
+  mat.onBeforeCompile = (shader) => {
+    // hook our uniforms in
+    shader.uniforms.uFadeStart = uniforms.uFadeStart;
+    shader.uniforms.uFadeEnd   = uniforms.uFadeEnd;
+    shader.uniforms.uEnabled   = uniforms.uEnabled;
+    shader.uniforms.uDither    = uniforms.uDither;
+
+    // pass view-space depth from vertex to fragment
+    shader.vertexShader = shader.vertexShader
+    .replace(
+      'void main() {',
+      `
+        varying float vDepth; // positive distance from camera
+        void main() {
+      `
+      )
+    .replace(
+      '#include <begin_vertex>',
+      `
+        #include <begin_vertex>
+        vec3 mvPosition3 = (modelViewMatrix * vec4( transformed, 1.0 )).xyz;
+        vDepth = -mvPosition3.z;
+      `
+      );
+
+
+
+    // fade + optional dither in fragment
+    shader.fragmentShader = shader.fragmentShader
+    .replace(
+      'void main() {',
+      `
+    varying float vDepth;
+    // renamed to avoid colliding with three's own rand()
+    float hash12(vec2 p){
+      return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453);
+    }
+    void main() {
+      `
+      )
+    .replace(
+      '#include <dithering_fragment>',
+      `
+    #include <dithering_fragment>
+    if (uEnabled > 0){
+      // smooth fade: 1 near, 0 far
+      float fade = smoothstep(uFadeEnd, uFadeStart, vDepth);
+
+      #ifndef ALPHATEST
+      // multiply alpha for blended fade
+      diffuseColor.a *= fade;
+      #endif
+
+      // optional screen-door dither to avoid sorting artifacts
+      if (uDither > 0){
+        float r = hash12(gl_FragCoord.xy);
+        if (r > diffuseColor.a) discard;
+      }
+    }
+      `
+      );
+
+
+
+
+  };
+
+  mat.needsUpdate = true;
+  return mat;
+}
+
+function updateDepthFadeUniforms(mat){
+  const u = mat.userData.depthFadeUniforms;
+  if (!u) return;
+  u.uFadeStart.value = Math.min(params.fadeStart, params.fadeEnd);
+  u.uFadeEnd.value   = Math.max(params.fadeStart, params.fadeEnd);
+  u.uEnabled.value   = params.fadeEnabled ? 1 : 0;
+  u.uDither.value    = params.fadeDither ? 1 : 0;
+}
+
+function updateDepthFadeAll(){
+  // main cloud
+  updateDepthFadeUniforms(cloudMaterial);
+  // external point clouds
+  externalGroups.forEach(g => updateDepthFadeUniforms(g.material));
+  if (paused) renderer.render(scene,camera);
+}
+
+
+
+    // ---------- Cloud ----------
+
+const cloudMaterial = new THREE.PointsMaterial({
+  size: params.pointSize,
+  vertexColors: true,
+  sizeAttenuation: true,
+  transparent: true
+});
+attachDepthFadeToPointsMaterial(cloudMaterial);
+
+
+
+const cloudGeom = new THREE.BufferGeometry();
+const cloudPoints = new THREE.Points(cloudGeom, cloudMaterial);
+cloudGroup.add(cloudPoints);
+
+// let lastPos=null, nextPos=null, curPos=null, curCol=null, baseCol=null;
+// let tweenT = 1, targetTweenMs = 120, lastArrival = performance.now();
+
+
+let lastPos=null, nextPos=null, curPos=null, curCol=null, baseCol=null;
+
+// Build/Dissolve still use tween for their finite animations:
+let tweenT = 1, targetTweenMs = 120;
+
+// Live smoothing (continuous, no restarts):
+let lastArrival = performance.now();
+let tauMs = 140;      // time constant for EMA (ms)
+let emaInit = false;  // first-packet guard
+
+// Spring smoothing (snappier than EMA)
+let velPos = null;                 // Float32Array same length as curPos
+const springK = 40;                // stiffness (try 20..80)
+const springC = 2 * Math.sqrt(springK); // critical damping
+
+
 
     // point sprite textures
-    let shapeTexture = null;
-    function makeCircleTexture(size=64, feather=1.5){
-      const c = document.createElement('canvas'); c.width=c.height=size;
-      const ctx=c.getContext('2d'); const cx=size/2, cy=size/2, r=size/2-1;
-      const img=ctx.createImageData(size,size);
-      for(let y=0;y<size;y++)for(let x=0;x<size;x++){
-        const dx=x-cx+0.5, dy=y-cy+0.5, d=Math.sqrt(dx*dx+dy*dy);
-        let a = 1 - (d - (r-1)) * feather / 3; a=Math.max(0,Math.min(1,a));
-        const i=(y*size+x)*4; img.data[i+3]=Math.round(a*255); img.data[i]=img.data[i+1]=img.data[i+2]=255;
+let shapeTexture = null;
+function makeCircleTexture(size=64, feather=1.5){
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const ctx=c.getContext('2d'); const cx=size/2, cy=size/2, r=size/2-1;
+  const img=ctx.createImageData(size,size);
+  for(let y=0;y<size;y++)for(let x=0;x<size;x++){
+    const dx=x-cx+0.5, dy=y-cy+0.5, d=Math.sqrt(dx*dx+dy*dy);
+    let a = 1 - (d - (r-1)) * feather / 3; a=Math.max(0,Math.min(1,a));
+    const i=(y*size+x)*4; img.data[i+3]=Math.round(a*255); img.data[i]=img.data[i+1]=img.data[i+2]=255;
+  }
+  ctx.putImageData(img,0,0);
+  const tex=new THREE.CanvasTexture(c); tex.minFilter=tex.magFilter=THREE.LinearFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
+}
+function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
+  const c=document.createElement('canvas'); c.width=c.height=size; const ctx=c.getContext('2d');
+  const img=ctx.createImageData(size,size); const half=size/2; const halfBar=(thickness*size)*0.5;
+  const smooth=(e0,e1,x)=>{const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));return t*t*(3-2*t);}
+  for(let y=0;y<size;y++)for(let x=0;x<size;x++){
+    const dx=x+0.5-half, dy=y+0.5-half;
+    const av=1-smooth(0,feather,Math.max(0,Math.abs(dx)-halfBar));
+    const ah=1-smooth(0,feather,Math.max(0,Math.abs(dy)-halfBar));
+    const a=Math.max(0,Math.min(1,Math.max(av,ah)));
+    const i=(y*size+x)*4; img.data[i+3]=Math.round(a*255); img.data[i]=img.data[i+1]=img.data[i+2]=255;
+  }
+  ctx.putImageData(img,0,0);
+  const tex=new THREE.CanvasTexture(c); tex.minFilter=tex.magFilter=THREE.LinearFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
+}
+
+    // --- NEW BLOCK: External model groups state (place after params) ---
+    let externalGroups = []; // [{ id, name, group, points, material, basePositions, baseColors, density, visible }]
+    let groupIdSeq = 1;
+    let selectedGroupId = null;
+
+    // Shared TransformControls for positioning models
+    const tControls = new TransformControls(camera, renderer.domElement);
+    tControls.setMode("translate"); // default; user can toggle in GUI
+    tControls.addEventListener('dragging-changed', e => { controls.enabled = !e.value && !renderer.xr.isPresenting; });
+
+    // scene.add(tControls);
+
+    // With this:
+    const addControlsRoot = () => {
+      const root = tControls._root || tControls; // future-proof
+      if (root.parent !== scene) scene.add(root);
+    };
+    addControlsRoot();
+
+
+    function selectExternalGroup(id) {
+      selectedGroupId = id;
+      const rec = externalGroups.find(g => g.id === id);
+      if (rec) {
+        addControlsRoot();        // make sure gizmo root is in the scene
+        tControls.attach(rec.group);
+      } else {
+        tControls.detach();
+        // optional: remove the gizmo from the scene when nothing is selected
+        if (tControls._root?.parent) tControls._root.parent.remove(tControls._root);
       }
-      ctx.putImageData(img,0,0);
-      const tex=new THREE.CanvasTexture(c); tex.minFilter=tex.magFilter=THREE.LinearFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
     }
-    function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
-      const c=document.createElement('canvas'); c.width=c.height=size; const ctx=c.getContext('2d');
-      const img=ctx.createImageData(size,size); const half=size/2; const halfBar=(thickness*size)*0.5;
-      const smooth=(e0,e1,x)=>{const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));return t*t*(3-2*t);}
-      for(let y=0;y<size;y++)for(let x=0;x<size;x++){
-        const dx=x+0.5-half, dy=y+0.5-half;
-        const av=1-smooth(0,feather,Math.max(0,Math.abs(dx)-halfBar));
-        const ah=1-smooth(0,feather,Math.max(0,Math.abs(dy)-halfBar));
-        const a=Math.max(0,Math.min(1,Math.max(av,ah)));
-        const i=(y*size+x)*4; img.data[i+3]=Math.round(a*255); img.data[i]=img.data[i+1]=img.data[i+2]=255;
-      }
-      ctx.putImageData(img,0,0);
-      const tex=new THREE.CanvasTexture(c); tex.minFilter=tex.magFilter=THREE.LinearFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
+
+
+    // Keep point size/shape of all external point clouds in sync with main params
+
+
+    // function makePointMaterialFromParams() {
+    //   const mat = new THREE.PointsMaterial({
+    //     size: params.pointSize,
+    //     vertexColors: true,
+    //     sizeAttenuation: true,
+    //     transparent: (params.pointShape !== "square"),
+    //     map: (shapeTexture || null),
+    //     alphaTest: (params.pointShape === "square" ? 0.0 : 0.5)
+    //   });
+    //   return mat;
+    // }
+
+
+    function makePointMaterialFromParams() {
+      const mat = new THREE.PointsMaterial({
+        size: params.pointSize,
+        vertexColors: true,
+        sizeAttenuation: true,
+        transparent: (params.pointShape !== "square"),
+        map: (shapeTexture || null),
+        alphaTest: (params.pointShape === "square" ? 0.0 : 0.5)
+      });
+      attachDepthFadeToPointsMaterial(mat);
+      return mat;
     }
+
+
+
+    function updateExternalPointMaterials() {
+      externalGroups.forEach(g => {
+        g.material.size = params.pointSize;
+        g.material.map = (shapeTexture || null);
+        g.material.alphaTest = (params.pointShape === "square" ? 0.0 : 0.5);
+        g.material.transparent = true;  // <—
+        g.material.depthWrite  = false; // <—
+        g.material.needsUpdate = true;
+      });
+    }
+
+    // --- END NEW BLOCK ---
+
+
     function setPointShape(){
       if (shapeTexture){ shapeTexture.dispose(); shapeTexture=null; }
-      if (params.pointShape==="square"){ cloudMaterial.map=null; cloudMaterial.alphaTest=0; cloudMaterial.transparent=false; }
-      else if (params.pointShape==="circle"){ shapeTexture=makeCircleTexture(64,params.shapeFeather); cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true; }
-      else { shapeTexture=makeCrossTexture(64,params.crossThickness,params.shapeFeather); cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true; }
-      cloudMaterial.needsUpdate=true; if (paused) renderer.render(scene,camera);
+
+      if (params.pointShape==="square"){
+        cloudMaterial.map = null;
+        cloudMaterial.alphaTest = 0.0;
+      } else if (params.pointShape==="circle"){
+        shapeTexture = makeCircleTexture(64, params.shapeFeather);
+        cloudMaterial.map = shapeTexture;
+        cloudMaterial.alphaTest = 0.5;
+      } else { // cross
+        shapeTexture = makeCrossTexture(64, params.crossThickness, params.shapeFeather);
+        cloudMaterial.map = shapeTexture;
+        cloudMaterial.alphaTest = 0.5;
+      }
+
+      // important: keep blending path enabled so fade works
+      cloudMaterial.transparent = true;       // <—
+      cloudMaterial.depthWrite  = false;      // helps with sorting of translucent points
+      cloudMaterial.needsUpdate = true;
+
+      updateExternalPointMaterials();
+      if (paused) renderer.render(scene,camera);
     }
+
+
+
+//     function setPointShape(){
+
+
+// // --- REPLACE BODY OF setPointShape() (keep your function name/signature) ---
+//       if (shapeTexture){ shapeTexture.dispose(); shapeTexture=null; }
+//       if (params.pointShape==="square"){
+//         cloudMaterial.map=null; cloudMaterial.alphaTest=0; cloudMaterial.transparent=false;
+//       } else if (params.pointShape==="circle"){
+//         shapeTexture=makeCircleTexture(64,params.shapeFeather);
+//         cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true;
+//       } else {
+//         shapeTexture=makeCrossTexture(64,params.crossThickness,params.shapeFeather);
+//         cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true;
+//       }
+//       cloudMaterial.needsUpdate=true;
+//       updateExternalPointMaterials();
+//       if (paused) renderer.render(scene,camera);
+// // --- END REPLACE ---
+
+
+//       // if (shapeTexture){ shapeTexture.dispose(); shapeTexture=null; }
+
+//       // if (params.pointShape==="square"){ cloudMaterial.map=null; cloudMaterial.alphaTest=0; cloudMaterial.transparent=false; }
+//       // else if (params.pointShape==="circle"){ shapeTexture=makeCircleTexture(64,params.shapeFeather); cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true; }
+//       // else { shapeTexture=makeCrossTexture(64,params.crossThickness,params.shapeFeather); cloudMaterial.map=shapeTexture; cloudMaterial.alphaTest=0.5; cloudMaterial.transparent=true; }
+
+//       // cloudMaterial.needsUpdate=true; if (paused) renderer.render(scene,camera);
+
+
+//     }
+
+
     setPointShape();
 
     function ensureCloudBuffers(N){
@@ -243,8 +1113,14 @@
       applyFilter(curCol, baseCol);
     }
 
-    // ---------- Collision + Rain (unchanged behavior) ----------
+
+
+
+
+    // ---------- Collision + Rain ----------
     const CELL=0.03, SAMPLE_STRIDE=3, COLLISION_RADIUS=0.045;
+
+
     let occGrid=new Map();
     let cloudBounds={ center:new THREE.Vector3(0,0,-1.2), radius:0.8 };
     const keyFrom=(ix,iy,iz)=>`${ix},${iy},${iz}`;
@@ -280,27 +1156,94 @@
       return false;
     }
 
-    const RAIN_COUNT=1200, GRAVITY_BASE=1.6, HIT_FLASH_MS=180, STICK_MS=700, RAIN_SPREAD=1.2;
-    const BEHAVIOUR={ STICK:1, FLY_UP:2, RADIAL:3, RANDOM:4 }; let behaviour=BEHAVIOUR.STICK;
 
-    const rainGeom=new THREE.BufferGeometry();
-    const rainPos=new Float32Array(RAIN_COUNT*3);
-    const rainCol=new Float32Array(RAIN_COUNT*3);
-    const rainVX=new Float32Array(RAIN_COUNT), rainVY=new Float32Array(RAIN_COUNT), rainVZ=new Float32Array(RAIN_COUNT);
-    const rainFlash=new Float32Array(RAIN_COUNT), rainStick=new Float32Array(RAIN_COUNT), rainBounce=new Float32Array(RAIN_COUNT);
+
+
+
+
+    // const RAIN_COUNT=1200, GRAVITY_BASE=1.6, HIT_FLASH_MS=180, STICK_MS=700, RAIN_SPREAD=1.2;
+    // const BEHAVIOUR={ STICK:1, FLY_UP:2, RADIAL:3, RANDOM:4 }; let behaviour=BEHAVIOUR.STICK;
+
+    // const rainGeom=new THREE.BufferGeometry();
+    // const rainPos=new Float32Array(RAIN_COUNT*3);
+    // const rainCol=new Float32Array(RAIN_COUNT*3);
+    // const rainVX=new Float32Array(RAIN_COUNT), rainVY=new Float32Array(RAIN_COUNT), rainVZ=new Float32Array(RAIN_COUNT);
+    // const rainFlash=new Float32Array(RAIN_COUNT), rainStick=new Float32Array(RAIN_COUNT), rainBounce=new Float32Array(RAIN_COUNT);
+
+    // function respawnDrop(i){
+    //   const R=cloudBounds.radius||0.8, c=cloudBounds.center, spread=R*RAIN_SPREAD;
+    //   rainPos[3*i]=c.x+(Math.random()*2-1)*spread; rainPos[3*i+2]=c.z+(Math.random()*2-1)*spread; rainPos[3*i+1]=c.y+(R+0.6+Math.random()*0.4);
+    //   const s=params.rainSpeed; rainVX[i]=0; rainVY[i]=-(0.6+Math.random()*0.4)*s; rainVZ[i]=0; rainFlash[i]=rainStick[i]=rainBounce[i]=0;
+    //   rainCol[3*i]=0.5; rainCol[3*i+1]=0.7; rainCol[3*i+2]=1.0;
+    // }
+    // (function initRain(){
+    //   for(let i=0;i<RAIN_COUNT;i++) respawnDrop(i);
+    //     rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPos,3));
+    //   rainGeom.setAttribute('color', new THREE.BufferAttribute(rainCol,3));
+    //   const rainMat=new THREE.PointsMaterial({ size:0.002, vertexColors:true, sizeAttenuation:true });
+    //   const rainPoints = new THREE.Points(rainGeom, rainMat);
+    //   cloudGroup.add(rainPoints);
+    // })();
+
+
+// --- RAIN: dynamic, GUI-tweakable count + size ---
+    const GRAVITY_BASE = 1.6, HIT_FLASH_MS = 180, STICK_MS = 700, RAIN_SPREAD = 1.2;
+    const BEHAVIOUR = { STICK:1, FLY_UP:2, RADIAL:3, RANDOM:4 }; let behaviour = BEHAVIOUR.STICK;
+
+    let rainGeom = null, rainMat = null, rainPoints = null;
+    let rainPos = null, rainCol = null, rainVX = null, rainVY = null, rainVZ = null, rainFlash = null, rainStick = null, rainBounce = null;
 
     function respawnDrop(i){
-      const R=cloudBounds.radius||0.8, c=cloudBounds.center, spread=R*RAIN_SPREAD;
-      rainPos[3*i]=c.x+(Math.random()*2-1)*spread; rainPos[3*i+2]=c.z+(Math.random()*2-1)*spread; rainPos[3*i+1]=c.y+(R+0.6+Math.random()*0.4);
-      const s=params.rainSpeed; rainVX[i]=0; rainVY[i]=-(0.6+Math.random()*0.4)*s; rainVZ[i]=0; rainFlash[i]=rainStick[i]=rainBounce[i]=0;
-      rainCol[3*i]=0.5; rainCol[3*i+1]=0.7; rainCol[3*i+2]=1.0;
+      const R = cloudBounds.radius || 0.8, c = cloudBounds.center, spread = R*RAIN_SPREAD;
+      rainPos[3*i]   = c.x + (Math.random()*2-1)*spread;
+      rainPos[3*i+2] = c.z + (Math.random()*2-1)*spread;
+      rainPos[3*i+1] = c.y + (R+0.6+Math.random()*0.4);
+
+      const s = params.rainSpeed;
+      rainVX[i] = 0; rainVY[i] = -(0.6+Math.random()*0.4)*s; rainVZ[i] = 0;
+      rainFlash[i] = 0; rainStick[i] = 0; rainBounce[i] = 0;
+
+      rainCol[3*i] = 0.5; rainCol[3*i+1] = 0.7; rainCol[3*i+2] = 1.0;
     }
-    (function initRain(){ for(let i=0;i<RAIN_COUNT;i++) respawnDrop(i);
-      rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPos,3));
-      rainGeom.setAttribute('color', new THREE.BufferAttribute(rainCol,3));
-      const rainMat=new THREE.PointsMaterial({ size:0.012, vertexColors:true, sizeAttenuation:true });
-      scene.add(new THREE.Points(rainGeom, rainMat));
-    })();
+
+    function rebuildRain(count){
+      count = Math.max(0, Math.min(20000, count|0));
+
+  // remove old
+      if (rainPoints){
+        cloudGroup.remove(rainPoints);
+        rainGeom?.dispose();
+        rainMat?.dispose();
+      }
+
+  // allocate
+      rainGeom = new THREE.BufferGeometry();
+      rainPos  = new Float32Array(count*3);
+      rainCol  = new Float32Array(count*3);
+      rainVX   = new Float32Array(count);
+      rainVY   = new Float32Array(count);
+      rainVZ   = new Float32Array(count);
+      rainFlash= new Float32Array(count);
+      rainStick= new Float32Array(count);
+      rainBounce=new Float32Array(count);
+
+      for (let i=0;i<count;i++) respawnDrop(i);
+
+        rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPos,3));
+      rainGeom.setAttribute('color',    new THREE.BufferAttribute(rainCol,3));
+
+      rainMat = new THREE.PointsMaterial({
+        size: params.rainSize,
+        vertexColors: true,
+        sizeAttenuation: true
+      });
+
+      rainPoints = new THREE.Points(rainGeom, rainMat);
+      cloudGroup.add(rainPoints);
+    }
+
+// build once
+    rebuildRain(params.rainCount);
 
     function impulseOnHit(i){
       rainFlash[i]=HIT_FLASH_MS;
@@ -312,8 +1255,10 @@
     }
 
     function stepRain(dt){
-      const R=(cloudBounds.radius||0.8)+0.5, floorY=cloudBounds.center.y-R, grav=GRAVITY_BASE*params.rainSpeed;
-      for (let i=0;i<RAIN_COUNT;i++){
+      if (!rainVX) return;
+      const count = rainVX.length;
+      const R = (cloudBounds.radius||0.8)+0.5, floorY=cloudBounds.center.y-R, grav=GRAVITY_BASE*params.rainSpeed;
+      for (let i=0;i<count;i++){
         const base=3*i;
         if (rainStick[i]>0){ rainStick[i]-=dt*1000; rainFlash[i]=Math.max(rainFlash[i],40); }
         else {
@@ -321,43 +1266,75 @@
           rainVY[i]-=g*dt; rainPos[base]+=rainVX[i]*dt; rainPos[base+1]+=rainVY[i]*dt; rainPos[base+2]+=rainVZ[i]*dt;
           if (collidesWithCloud(rainPos[base],rainPos[base+1],rainPos[base+2])) impulseOnHit(i);
         }
-        if (rainFlash[i]>0){ rainFlash[i]-=dt*1000; const t=Math.max(0,Math.min(1,rainFlash[i]/HIT_FLASH_MS));
-        rainCol[base]=1.0*t+0.5*(1-t); rainCol[base+1]=0.1*t+0.7*(1-t); rainCol[base+2]=0.1*t+1.0*(1-t);
-      } else if (rainStick[i]<=0){ rainCol[base]=0.5; rainCol[base+1]=0.7; rainCol[base+2]=1.0; }
-      const c=cloudBounds.center;
-      const far=Math.hypot(rainPos[base]-c.x,rainPos[base+1]-c.y,rainPos[base+2]-c.z)>(cloudBounds.radius+2.5);
-      if ((rainStick[i]<=0 && rainPos[base+1]<floorY) || far) respawnDrop(i);
+        if (rainFlash[i]>0){
+          rainFlash[i]-=dt*1000; const t=Math.max(0,Math.min(1,rainFlash[i]/HIT_FLASH_MS));
+          rainCol[base]=1.0*t+0.5*(1-t); rainCol[base+1]=0.1*t+0.7*(1-t); rainCol[base+2]=0.1*t+1.0*(1-t);
+        } else if (rainStick[i]<=0){ rainCol[base]=0.5; rainCol[base+1]=0.7; rainCol[base+2]=1.0; }
+        const c=cloudBounds.center;
+        const far=Math.hypot(rainPos[base]-c.x,rainPos[base+1]-c.y,rainPos[base+2]-c.z)>(cloudBounds.radius+2.5);
+        if ((rainStick[i]<=0 && rainPos[base+1]<floorY) || far) respawnDrop(i);
+      }
+      rainGeom.getAttribute('position').needsUpdate=true; rainGeom.getAttribute('color').needsUpdate=true;
     }
-    rainGeom.getAttribute('position').needsUpdate=true; rainGeom.getAttribute('color').needsUpdate=true;
-  }
+
+
+    // function impulseOnHit(i){
+    //   rainFlash[i]=HIT_FLASH_MS;
+    //   const x=rainPos[3*i], y=rainPos[3*i+1], z=rainPos[3*i+2], c=cloudBounds.center, s=params.rainSpeed;
+    //   if (behaviour===BEHAVIOUR.STICK){ rainStick[i]=STICK_MS; rainVX[i]=rainVY[i]=rainVZ[i]=0; }
+    //   else if (behaviour===BEHAVIOUR.FLY_UP){ rainVY[i]=(3.2+Math.random()*0.8)*s; rainVX[i]=(Math.random()*2-1)*0.3*s; rainVZ[i]=(Math.random()*2-1)*0.3*s; rainBounce[i]=450; }
+    //   else if (behaviour===BEHAVIOUR.RADIAL){ let dx=x-c.x,dy=y-c.y,dz=z-c.z; const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const sp=(2.4+Math.random()*0.8)*s; rainVX[i]=dx*sp; rainVY[i]=dy*sp; rainVZ[i]=dz*sp; rainBounce[i]=600; }
+    //   else { let dx=Math.random()*2-1,dy=Math.random()*2-1,dz=Math.random()*2-1; const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const sp=(2.2+Math.random()*1.2)*s; rainVX[i]=dx*sp; rainVY[i]=dy*sp; rainVZ[i]=dz*sp; rainBounce[i]=500; }
+    // }
+
+    // function stepRain(dt){
+    //   const R=(cloudBounds.radius||0.8)+0.5, floorY=cloudBounds.center.y-R, grav=GRAVITY_BASE*params.rainSpeed;
+    //   for (let i=0;i<RAIN_COUNT;i++){
+    //     const base=3*i;
+    //     if (rainStick[i]>0){ rainStick[i]-=dt*1000; rainFlash[i]=Math.max(rainFlash[i],40); }
+    //     else {
+    //       let g=grav; if (rainBounce[i]>0){ g*=0.25; rainBounce[i]-=dt*1000; }
+    //       rainVY[i]-=g*dt; rainPos[base]+=rainVX[i]*dt; rainPos[base+1]+=rainVY[i]*dt; rainPos[base+2]+=rainVZ[i]*dt;
+    //       if (collidesWithCloud(rainPos[base],rainPos[base+1],rainPos[base+2])) impulseOnHit(i);
+    //     }
+    //     if (rainFlash[i]>0){
+    //       rainFlash[i]-=dt*1000; const t=Math.max(0,Math.min(1,rainFlash[i]/HIT_FLASH_MS));
+    //       rainCol[base]=1.0*t+0.5*(1-t); rainCol[base+1]=0.1*t+0.7*(1-t); rainCol[base+2]=0.1*t+1.0*(1-t);
+    //     } else if (rainStick[i]<=0){ rainCol[base]=0.5; rainCol[base+1]=0.7; rainCol[base+2]=1.0; }
+    //     const c=cloudBounds.center;
+    //     const far=Math.hypot(rainPos[base]-c.x,rainPos[base+1]-c.y,rainPos[base+2]-c.z)>(cloudBounds.radius+2.5);
+    //     if ((rainStick[i]<=0 && rainPos[base+1]<floorY) || far) respawnDrop(i);
+    //   }
+    //   rainGeom.getAttribute('position').needsUpdate=true; rainGeom.getAttribute('color').needsUpdate=true;
+    // }
 
     // ---------- Transitions / Export / Keys ----------
-  function startBuild(){ if (!curPos||!nextPos) return;
-  if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
-  const R=(cloudBounds.radius||0.8)*2.5, c=cloudBounds.center;
-  for (let i=0;i<lastPos.length;i+=3){
-    let rx=Math.random()*2-1, ry=Math.random()*2-1, rz=Math.random()*2-1; const L=Math.hypot(rx,ry,rz)||1; rx/=L; ry/=L; rz/=L;
-    const d=(0.3+Math.random()*0.7)*R; lastPos[i]=c.x+rx*d; lastPos[i+1]=c.y+ry*d; lastPos[i+2]=c.z+rz*d;
-    curPos[i]=lastPos[i]; curPos[i+1]=lastPos[i+1]; curPos[i+2]=lastPos[i+2];
+    function startBuild(){ if (!curPos||!nextPos) return;
+    if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
+    const R=(cloudBounds.radius||0.8)*2.5, c=cloudBounds.center;
+    for (let i=0;i<lastPos.length;i+=3){
+      let rx=Math.random()*2-1, ry=Math.random()*2-1, rz=Math.random()*2-1; const L=Math.hypot(rx,ry,rz)||1; rx/=L; ry/=L; rz/=L;
+      const d=(0.3+Math.random()*0.7)*R; lastPos[i]=c.x+rx*d; lastPos[i+1]=c.y+ry*d; lastPos[i+2]=c.z+rz*d;
+      curPos[i]=lastPos[i]; curPos[i+1]=lastPos[i+1]; curPos[i+2]=lastPos[i+2];
+    }
+    cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
+    targetTweenMs=BUILD_MS; tweenT=0; transitionMode=TRANSITION.BUILD;
+    cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
+    statusText=`Build: tweening in ${BUILD_MS}ms`;
   }
-  cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
-  targetTweenMs=BUILD_MS; tweenT=0; transitionMode=TRANSITION.BUILD;
-  cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
-  statusText=`Build: tweening in ${BUILD_MS}ms`;
-}
 
-function startDissolve(){ if (!curPos) return;
-if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
-const c=cloudBounds.center, speedBase=DISSOLVE_SPEED*Math.max(1,cloudBounds.radius||1);
-for (let i=0;i<curPos.length;i+=3){
-  let dx=curPos[i]-c.x, dy=curPos[i+1]-c.y, dz=curPos[i+2]-c.z;
-  if (!(isFinite(dx)&&isFinite(dy)&&isFinite(dz)) || (Math.abs(dx)+Math.abs(dy)+Math.abs(dz)<1e-6)){ dx=Math.random()*2-1; dy=Math.random()*2-1; dz=Math.random()*2-1; }
-  const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const s=speedBase*(0.6+Math.random()*1.4);
-  dissolveVel[i]=dx*s; dissolveVel[i+1]=dy*s; dissolveVel[i+2]=dz*s;
-}
-dissolveElapsed=0; transitionMode=TRANSITION.DISSOLVE;
-cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
-statusText=`Dissolve: flying out for ${DISSOLVE_MS}ms`;
+  function startDissolve(){ if (!curPos) return;
+  if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
+  const c=cloudBounds.center, speedBase=DISSOLVE_SPEED*Math.max(1,cloudBounds.radius||1);
+  for (let i=0;i<curPos.length;i+=3){
+    let dx=curPos[i]-c.x, dy=curPos[i+1]-c.y, dz=curPos[i+2]-c.z;
+    if (!(isFinite(dx)&&isFinite(dy)&&isFinite(dz)) || (Math.abs(dx)+Math.abs(dy)+Math.abs(dz)<1e-6)){ dx=Math.random()*2-1; dy=Math.random()*2-1; dz=Math.random()*2-1; }
+    const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const s=speedBase*(0.6+Math.random()*1.4);
+    dissolveVel[i]=dx*s; dissolveVel[i+1]=dy*s; dissolveVel[i+2]=dz*s;
+  }
+  dissolveElapsed=0; transitionMode=TRANSITION.DISSOLVE;
+  cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
+  statusText=`Dissolve: flying out for ${DISSOLVE_MS}ms`;
 }
 
 function resetTransition(){
@@ -366,6 +1343,9 @@ function resetTransition(){
   cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
   statusText="Live: normal tweening";
 }
+
+
+// Save Blob
 
 function saveBlob(blob, filename){ const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
 function timestamp(){ const ts=new Date(), pad=n=>String(n).padStart(2,"0"); return `${ts.getFullYear()}-${pad(ts.getMonth()+1)}-${pad(ts.getDate())}_${pad(ts.getHours())}-${pad(ts.getMinutes())}_${pad(ts.getSeconds())}`; }
@@ -381,33 +1361,157 @@ function buildMeshFromGrid(curPos, curCol, w, h, exportStride=2, maxEdge=0.08){
     positions.push(X,Y,Z); const r=curCol[gi]??1, g=curCol[gi+1]??1, b=curCol[gi+2]??1; colors.push(r,g,b); indexMap[idxM(j,i)]=vcount++;
   }
 }
-const vIdx=(j,i)=>indexMap[idxM(j,i)]; const d2=(ax,ay,az,bx,by,bz)=>{const dx=ax-bx,dy=ay-by,dz=az-bz;return dx*dx+dy*dy+dz*dz;}; const maxE2=maxEdge*maxEdge;
-const indices=[]; for (let j=0;j<ny-1;j++) for (let i=0;i<nx-1;i++){ const i00=vIdx(j,i),i10=vIdx(j,i+1),i01=vIdx(j+1,i),i11=vIdx(j+1,i+1); if (i00<0||i10<0||i01<0||i11<0) continue;
-const a0=i00*3,b0=i10*3,c0=i01*3,d0=i11*3;
-const okA=d2(positions[a0],positions[a0+1],positions[a0+2],positions[b0],positions[b0+1],positions[b0+2])<=maxE2 &&
-d2(positions[a0],positions[a0+1],positions[a0+2],positions[c0],positions[c0+1],positions[c0+2])<=maxE2 &&
-d2(positions[b0],positions[b0+1],positions[b0+2],positions[c0],positions[c0+1],positions[c0+2])<=maxE2;
-if (okA) indices.push(i00,i10,i01);
-const okB=d2(positions[b0],positions[b0+1],positions[b0+2],positions[d0],positions[d0+1],positions[d0+2])<=maxE2 &&
-d2(positions[b0],positions[b0+1],positions[b0+2],positions[c0],positions[c0+1],positions[c0+2])<=maxE2 &&
-d2(positions[d0],positions[d0+1],positions[d0+2],positions[c0],positions[c0+1],positions[c0+2])<=maxE2;
-if (okB) indices.push(i10,i11,i01);
-}
-if (!positions.length || !indices.length) return null;
-const geo=new THREE.BufferGeometry();
-geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
-geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors,3));
-geo.setIndex(indices);
-geo.computeVertexNormals();
-const mat=new THREE.MeshStandardMaterial({ vertexColors:true, roughness:1, metalness:0 });
-return new THREE.Mesh(geo,mat);
-}
+const vIdx=(j,i)=>indexMap[idxM(j,i)];
+      const d2=(ax,ay,az,bx,by,bz)=>{const dx=ax-bx,dy=ay-by,dz=ax-bz;return (ax-bx)*(ax-bx)+(ay-by)*(ay-by)+(az-bz)*(az-bz);} // safe inline
+      const maxE2=maxEdge*maxEdge;
+      const indices=[];
+      for (let j=0;j<ny-1;j++) for (let i=0;i<nx-1;i++){
+        const i00=vIdx(j,i),i10=vIdx(j,i+1),i01=vIdx(j+1,i),i11=vIdx(j+1,i+1); if (i00<0||i10<0||i01<0||i11<0) continue;
+        indices.push(i00,i10,i01, i10,i11,i01);
+      }
+      if (!positions.length || !indices.length) return null;
+      const geo=new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+      geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors,3));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      const mat=new THREE.MeshStandardMaterial({ vertexColors:true, roughness:1, metalness:0 });
+      return new THREE.Mesh(geo,mat);
+    }
 
-function buildPointsNodeFromCloud(){
-  if (!cloudGeom||!cloudGeom.attributes?.position) return null;
-  const mat=new THREE.PointsMaterial({ size:params.pointSize, vertexColors:true, sizeAttenuation:true });
-  return new THREE.Points(cloudGeom.clone(), mat);
+    function buildPointsNodeFromCloud(){
+      if (!cloudGeom||!cloudGeom.attributes?.position) return null;
+      const mat=new THREE.PointsMaterial({ size:params.pointSize, vertexColors:true, sizeAttenuation:true });
+      return new THREE.Points(cloudGeom.clone(), mat);
+    }
+
+
+// --- NEW BLOCK: GLTF -> point cloud + density utilities ---
+    function gltfToPoints(gltf, { name="Model", density=1.0 } = {}) {
+  // Collect raw positions/colors from all meshes
+      const pos = [];
+      const col = [];
+      const tmpColor = new THREE.Color(1,1,1);
+      gltf.scene.traverse(node => {
+        if (!node.isMesh || !node.geometry) return;
+        const geo = node.geometry;
+        geo.computeBoundingSphere?.();
+
+    // Pull positions in world space
+        const posAttr = geo.getAttribute('position');
+        if (!posAttr) return;
+
+    // Try vertex colors first, else material color (if any)
+        const colorAttr = geo.getAttribute('color');
+        let matColor = tmpColor;
+        if (node.material && node.material.color) matColor.copy(node.material.color);
+
+    // Build a temp matrix to bake node transform
+        node.updateWorldMatrix(true, false);
+        const m = node.matrixWorld;
+
+        for (let i = 0; i < posAttr.count; i++) {
+          const vx = posAttr.getX(i), vy = posAttr.getY(i), vz = posAttr.getZ(i);
+      // world transform
+          const wx = m.elements[0]*vx + m.elements[4]*vy + m.elements[8]*vz  + m.elements[12];
+          const wy = m.elements[1]*vx + m.elements[5]*vy + m.elements[9]*vz  + m.elements[13];
+          const wz = m.elements[2]*vx + m.elements[6]*vy + m.elements[10]*vz + m.elements[14];
+          pos.push(wx, wy, wz);
+
+          if (colorAttr) {
+            col.push(colorAttr.getX(i) || 1, colorAttr.getY(i) || 1, colorAttr.getZ(i) || 1);
+          } else {
+            col.push(matColor.r, matColor.g, matColor.b);
+          }
+        }
+      });
+
+      if (pos.length === 0) {
+        console.warn("[viewer] GLTF had no mesh vertices to convert to points.");
+      }
+
+  // Optionally downsample to target density (0..1), random keep
+      let basePositions = new Float32Array(pos);
+      let baseColors    = new Float32Array(col);
+      if (density < 1.0 && density > 0) {
+        const keep = Math.max(1, Math.floor((basePositions.length/3) * density));
+        const idx = new Uint32Array(basePositions.length/3);
+        for (let i=0;i<idx.length;i++) idx[i]=i;
+    // Fisher–Yates shuffle first K
+          for (let i=0;i<keep;i++){
+            const j = i + Math.floor(Math.random() * (idx.length - i));
+            const t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+          }
+          const outP=new Float32Array(keep*3), outC=new Float32Array(keep*3);
+          for (let k=0;k<keep;k++){
+            const s = idx[k]*3, d=k*3;
+            outP[d]=basePositions[s]; outP[d+1]=basePositions[s+1]; outP[d+2]=basePositions[s+2];
+            outC[d]=baseColors[s]; outC[d+1]=baseColors[s+1]; outC[d+2]=baseColors[s+2];
+          }
+          basePositions = outP; baseColors = outC;
+        }
+
+  // Build Points geometry/material
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.BufferAttribute(basePositions.slice(), 3));
+        geom.setAttribute('color',    new THREE.BufferAttribute(baseColors.slice(),    3));
+        const material = makePointMaterialFromParams();
+        const points = new THREE.Points(geom, material);
+
+  // Group to carry transforms
+        const group = new THREE.Group();
+        group.add(points);
+
+  // Record
+        return {
+          id: groupIdSeq++,
+          name,
+          group,
+          points,
+          material,
+          basePositions,
+          baseColors,
+          density: Math.max(0.001, Math.min(1, density)),
+          visible: true
+        };
+      }
+
+// Resample an existing group's density (0..1), updates its Points geometry in-place
+      function resampleGroupDensity(rec, density) {
+        density = Math.max(0.001, Math.min(1, density));
+        rec.density = density;
+
+        const total = rec.basePositions.length/3;
+        const keep = Math.max(1, Math.floor(total * density));
+        const idx = new Uint32Array(total);
+        for (let i=0;i<idx.length;i++) idx[i]=i;
+          for (let i=0;i<keep;i++){
+            const j = i + Math.floor(Math.random() * (idx.length - i));
+            const t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+          }
+          const outP=new Float32Array(keep*3), outC=new Float32Array(keep*3);
+          for (let k=0;k<keep;k++){
+            const s = idx[k]*3, d=k*3;
+            outP[d]=rec.basePositions[s]; outP[d+1]=rec.basePositions[s+1]; outP[d+2]=rec.basePositions[s+2];
+            outC[d]=rec.baseColors[s];    outC[d+1]=rec.baseColors[s+1];    outC[d+2]=rec.baseColors[s+2];
+          }
+          rec.points.geometry.setAttribute('position', new THREE.BufferAttribute(outP,3));
+          rec.points.geometry.setAttribute('color',    new THREE.BufferAttribute(outC,3));
+          rec.points.geometry.attributes.position.needsUpdate = true;
+          rec.points.geometry.attributes.color.needsUpdate = true;
+          rec.points.geometry.computeBoundingSphere();
+        }
+
+// Add group to scene + registry
+        function addExternalGroup(rec) {
+          cloudGroup.add(rec.group);
+          externalGroups.push(rec);
+  rebuildGroupsGUI(); // refresh the “Models” panel
 }
+// --- END NEW BLOCK ---
+
+
+
 
 function exportGLB({ exportStride=2, maxEdge=0.08 }={}){
   if (!lastHeader||!curPos||!curCol) return; const {w,h}=lastHeader;
@@ -432,45 +1536,210 @@ function exportGLTF_JSON({ exportStride=2, maxEdge=0.08 }={}){
   },{binary:false,embedImages:true,onlyVisible:true,includeCustomExtensions:true});
 }
 
-window.addEventListener("keydown",(e)=>{ const k=e.key.toLowerCase();
-  if (k==="p") togglePause(); else if (k==="s") savePNG(); else if (k==="f") toggleFullscreen();
-  else if (k==="1") setBehaviour(1); else if (k==="2") setBehaviour(2); else if (k==="3") setBehaviour(3); else if (k==="4") setBehaviour(4);
-  else if (k==="g"&&!e.shiftKey) exportGLB({exportStride:2,maxEdge:0.08});
-  else if (k==="g"&&e.shiftKey) exportGLTF_JSON({exportStride:2,maxEdge:0.08});
-  else if (k==="t"){ const values=Object.values(FILTERS); const idx=values.indexOf(params.filter); params.filter=values[(idx+1)%values.length]; reapplyFilter(); }
-  else if (k==="b") startBuild(); else if (k==="d") startDissolve(); else if (k==="r") resetTransition();
+    // Keyboard shortcuts (unchanged)
+// window.addEventListener("keydown",(e)=>{ const k=e.key.toLowerCase();
+//   if (k==="p") togglePause(); else if (k==="s") savePNG(); else if (k==="f") toggleFullscreen();
+//   else if (k==="1") setBehaviour(1); else if (k==="2") setBehaviour(2); else if (k==="3") setBehaviour(3); else if (k==="4") setBehaviour(4);
+//   else if (k==="g"&&!e.shiftKey) exportGLB({exportStride:2,maxEdge:0.08});
+//   else if (k==="g"&&e.shiftKey) exportGLTF_JSON({exportStride:2,maxEdge:0.08});
+//   else if (k==="t"){ cycleFilter(); }
+//   else if (k==="b") startBuild(); else if (k==="d") startDissolve(); else if (k==="r") resetTransition();
+// });
+
+// --- REPLACE YOUR ENTIRE keyboard listener WITH THIS BLOCK ---
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+
+  // existing shortcuts
+  if (k === "p") togglePause();
+  else if (k === "s") savePNG();
+  else if (k === "f") toggleFullscreen();
+  else if (k === "1") setBehaviour(1);
+  else if (k === "2") setBehaviour(2);
+  else if (k === "3") setBehaviour(3);
+  else if (k === "4") setBehaviour(4);
+  else if (k === "g" && !e.shiftKey) exportGLB({ exportStride: 2, maxEdge: 0.08 });
+  else if (k === "g" && e.shiftKey)  exportGLTF_JSON({ exportStride: 2, maxEdge: 0.08 });
+  else if (k === "t") { cycleFilter(); }
+  else if (k === "b") startBuild();
+  else if (k === "d") startDissolve();
+
+  // keep your old 'r' behavior for reset
+  else if (k === "r" && !e.shiftKey) resetTransition();
+
+  // --- NEW: TransformControls modes ---
+  else if (k === "w") tControls.setMode("translate");
+  else if (k === "e") tControls.setMode("rotate");
+  else if (k === "r" && e.shiftKey) tControls.setMode("scale");
+
+  // --- NEW: cycle selection across external groups ---
+  else if (e.key === "ArrowRight") {
+    if (externalGroups.length) {
+      const idx = Math.max(0, externalGroups.findIndex(g => g.id === selectedGroupId));
+      const next = externalGroups[(idx + 1) % externalGroups.length];
+      selectExternalGroup(next.id);
+    }
+  } else if (e.key === "ArrowLeft") {
+    if (externalGroups.length) {
+      const idx = Math.max(0, externalGroups.findIndex(g => g.id === selectedGroupId));
+      const prev = externalGroups[(idx - 1 + externalGroups.length) % externalGroups.length];
+      selectExternalGroup(prev.id);
+    }
+  }
 });
+// --- END REPLACE ---
+
+
 
 function togglePause(){ paused=!paused; statusText=(paused?"[PAUSED] ":"")+statusText; if (paused) renderer.render(scene,camera); }
 function savePNG(){ try{ const url=renderer.domElement.toDataURL("image/png"); const a=document.createElement("a"); a.href=url; a.download=`pointcloud_${timestamp()}.png`; document.body.appendChild(a); a.click(); a.remove(); } catch(e){} }
 async function toggleFullscreen(){ try{ if (!document.fullscreenElement) await document.body.requestFullscreen({navigationUI:"hide"}).catch(()=>document.body.requestFullscreen()); else await document.exitFullscreen(); } catch(e){} }
 function setBehaviour(n){ behaviour=n; statusText=`mode=${n} (1=stick, 2=fly-up, 3=radial, 4=random)`; }
 function reapplyFilter(){ if (!baseCol||!curCol) return; applyFilter(curCol,baseCol); const attr=cloudGeom.getAttribute('color'); if (attr) attr.needsUpdate=true; if (paused) renderer.render(scene,camera); }
+function cycleFilter(){
+  const values=Object.values(FILTERS);
+  const idx=values.indexOf(params.filter);
+  params.filter = values[(idx+1)%values.length];
+  reapplyFilter();
+}
+
+    // NEW: hook buttons to same functions
+const on = (el, fn) => el && el.addEventListener('click', fn, { passive:true });
+on(btnPause, togglePause);
+on(btnSave,  savePNG);
+on(btnFull,  toggleFullscreen);
+on(btnBuild, startBuild);
+on(btnDissolve, startDissolve);
+on(btnReset, resetTransition);
+on(btnFilter, cycleFilter);
+btnModeEls.forEach(b=> b.addEventListener('click', ()=> setBehaviour(Number(b.dataset.mode)), { passive:true }));
 
 let lastFrameT=performance.now(), fpsCounter=0, fps=0, fpsT0=performance.now();
-function render(){
-  const t=performance.now(); const dt=(t-lastFrameT)/1000; lastFrameT=t;
-  if (transitionMode===TRANSITION.DISSOLVE && curPos && dissolveVel){
-    const L=curPos.length; dissolveElapsed+=dt; const tt=Math.min(1,dissolveElapsed/(DISSOLVE_MS/1000));
-    for (let i=0;i<L;i++) curPos[i]+=dissolveVel[i]*dt; cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
-      cloudMaterial.opacity=1-tt; if (tt>=1) cloudMaterial.opacity=0;
+
+function frame(nowMs){
+  const t = nowMs ?? performance.now();
+  const dt = (t - lastFrameT) / 1000; 
+  lastFrameT = t;
+
+  // --- transitions ---
+  if (transitionMode === TRANSITION.DISSOLVE && curPos && dissolveVel){
+    const L = curPos.length;
+    dissolveElapsed += dt;
+    const tt = Math.min(1, dissolveElapsed / (DISSOLVE_MS / 1000));
+    for (let i = 0; i < L; i++) curPos[i] += dissolveVel[i] * dt;
+      cloudGeom.getAttribute('position').needsUpdate = true;
+    cloudGeom.computeBoundingSphere();
+    cloudMaterial.opacity = 1 - tt; 
+    if (tt >= 1) cloudMaterial.opacity = 0;
   }
-  if (transitionMode===TRANSITION.BUILD && tweenT>=1) transitionMode=TRANSITION.NORMAL;
+  if (transitionMode === TRANSITION.BUILD && tweenT >= 1) {
+    transitionMode = TRANSITION.NORMAL;
+  }
+
   if (!paused){
-    if (tweenT<1 && curPos && nextPos && lastPos){
-      const step=(dt*1000)/Math.max(1,targetTweenMs); tweenT=Math.min(1,tweenT+step);
-      const L=curPos.length, a=1-tweenT, b=tweenT; for (let i=0;i<L;i++) curPos[i]=a*lastPos[i]+b*nextPos[i];
-      cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
+    // --- LIVE smoothing (EMA only) ---
+    if (transitionMode === TRANSITION.NORMAL && curPos && nextPos && curPos.length === nextPos.length){
+      const alpha = 1 - Math.exp(-(dt * 1000) / Math.max(1, tauMs)); // frame-rate independent
+      const L = curPos.length;
+      for (let i = 0; i < L; i++){
+        curPos[i] += (nextPos[i] - curPos[i]) * alpha;
+      }
+      cloudGeom.getAttribute('position').needsUpdate = true;
+      cloudGeom.computeBoundingSphere();
     }
-    stepRain(dt); controls.update(); renderer.render(scene,camera);
+
+    // rain + render
+    stepRain(dt);
+    if (!renderer.xr.isPresenting) controls.update();
+    renderer.render(scene, camera);
   }
-  fpsCounter++; const now=performance.now();
-  if (now-fpsT0>=1000){ fps=fpsCounter; fpsCounter=0; fpsT0=now; overlay.textContent=`${statusText} | ${fps} fps | [1..4] modes · [P]ause · [S]ave · [F]ullscreen · [G]/[Shift+G] export`; }
-  requestAnimationFrame(render);
+
+  // --- HUD / FPS ---
+  fpsCounter++;
+  const now = performance.now();
+  if (now - fpsT0 >= 1000){
+    fps = fpsCounter; 
+    fpsCounter = 0; 
+    fpsT0 = now;
+    overlay.textContent = `${statusText} | ${fps} fps | [1..4] modes · [P]ause · [S]ave · [F]ullscreen · [G]/[Shift+G] export`;
+  }
 }
 
 
- // ---------- WS + browser/server camera controls ----------
+
+
+// function frame(nowMs){
+//   const t=nowMs ?? performance.now();
+//   const dt=(t-lastFrameT)/1000; lastFrameT=t;
+
+//   if (transitionMode===TRANSITION.DISSOLVE && curPos && dissolveVel){
+//     const L=curPos.length; dissolveElapsed+=dt; const tt=Math.min(1,dissolveElapsed/(DISSOLVE_MS/1000));
+//     for (let i=0;i<L;i++) curPos[i]+=dissolveVel[i]*dt; cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
+//       cloudMaterial.opacity=1-tt; if (tt>=1) cloudMaterial.opacity=0;
+//   }
+//   if (transitionMode===TRANSITION.BUILD && tweenT>=1) transitionMode=TRANSITION.NORMAL;
+
+//   // if (!paused){
+//   //   if (tweenT<1 && curPos && nextPos && lastPos){
+//   //     const step=(dt*1000)/Math.max(1,targetTweenMs); tweenT=Math.min(1,tweenT+step);
+//   //     const L=curPos.length, a=1-tweenT, b=tweenT; for (let i=0;i<L;i++) curPos[i]=a*lastPos[i]+b*nextPos[i];
+//   //     cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
+//   //   }
+//   //   stepRain(dt);
+
+//   //   if (!renderer.xr.isPresenting) controls.update();
+//   //   renderer.render(scene,camera);
+//   // }
+
+
+//   if (!paused){
+//     // 4a) BUILD transition keeps using finite tween (easing)
+
+
+//     // 4b) LIVE smoothing: mass–spring–damper toward nextPos (snappier, still smooth)
+//     if (transitionMode === TRANSITION.NORMAL && curPos && nextPos && curPos.length === nextPos.length){
+//       if (!velPos || velPos.length !== curPos.length) velPos = new Float32Array(curPos.length);
+
+//       const k = springK, c = springC; // stiffness & damping
+//       const L = curPos.length;
+//       for (let i = 0; i < L; i++) {
+//         const x  = curPos[i];      // current
+//         const v  = velPos[i];      // velocity
+//         const xT = nextPos[i];     // target
+//         const a  = k * (xT - x) - c * v; // acceleration
+//         velPos[i] = v + a * dt;         // integrate velocity
+//         curPos[i] = x + velPos[i] * dt; // integrate position
+//       }
+
+//       cloudGeom.getAttribute('position').needsUpdate = true;
+//       cloudGeom.computeBoundingSphere();
+//     }
+
+
+//     // 4b) LIVE smoothing: continuous EMA toward latest nextPos (no restarts)
+//     if (transitionMode === TRANSITION.NORMAL && curPos && nextPos && curPos.length === nextPos.length){
+//       const alpha = 1 - Math.exp(-(dt * 1000) / Math.max(1, tauMs)); // frame-rate independent
+//       const L = curPos.length;
+//       for (let i=0; i<L; i++){
+//         curPos[i] += (nextPos[i] - curPos[i]) * alpha;
+//       }
+//       cloudGeom.getAttribute('position').needsUpdate = true;
+//       cloudGeom.computeBoundingSphere();
+//     }
+
+//     stepRain(dt);
+//     if (!renderer.xr.isPresenting) controls.update();
+//     renderer.render(scene, camera);
+//   }
+
+//   fpsCounter++; const now=performance.now();
+//   if (now-fpsT0>=1000){ fps=fpsCounter; fpsCounter=0; fpsT0=now; overlay.textContent=`${statusText} | ${fps} fps | [1..4] modes · [P]ause · [S]ave · [F]ullscreen · [G]/[Shift+G] export`; }
+// }
+
+    // XR render loop
+renderer.setAnimationLoop(frame);
+
+    // ---------- WS + browser/server camera controls ----------
 let ws=null, wsConnected=false, wsURLs=[], wsTry=0, wsTimer=null;
 let camStream=null, camVideo=null, camCnv=null, camCtx=null, camTimer=null;
 let currentCamId="";
@@ -479,10 +1748,7 @@ refreshBtn.addEventListener("click", async ()=>{ await populateCameraList(true);
 camSelect.addEventListener("change", async ()=>{ currentCamId=camSelect.value||""; if (params.source===SOURCE.BrowserCam) startWebcamStream(currentCamId); });
 
 srvRefresh.addEventListener("click", ()=>{ if (wsConnected) ws.send(JSON.stringify({cmd:"list_cams"})); });
-srvSelect.addEventListener("change", ()=>{
-  const idx = Number(srvSelect.value);
-  if (wsConnected) ws.send(JSON.stringify({cmd:"set_cam", index: idx}));
-});
+srvSelect.addEventListener("change", ()=>{ const idx = Number(srvSelect.value); if (wsConnected) ws.send(JSON.stringify({cmd:"set_cam", index: idx})); });
 
 function setBarsState(){
   const wsMode = params.source===SOURCE.PythonWS;
@@ -507,85 +1773,97 @@ async function populateCameraList(force=false){
 function stopWS(){ if (ws){ try{ ws.close(); }catch{} ws=null; } wsConnected=false; setBarsState(); }
 function stopWebcam(){ if (camTimer) cancelAnimationFrame(camTimer); camTimer=null; if (camVideo){ camVideo.pause(); camVideo.srcObject=null; camVideo=null; } if (camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; } camCnv=camCtx=null; }
 
-  // Prefer secure WSS first (matches the bundled WSS server), then fall back to WS for dev.
-function buildWSCandidates(port){
-  const host = location.hostname; // exactly how the page was opened
-  const urls = [];
-  if (location.protocol === "https:") {
-    urls.push(`wss://${host}:${port}`);
-    urls.push(`ws://${host}:${port}`);   // rare fallback
-  } else {
-    urls.push(`ws://${host}:${port}`);
-    urls.push(`wss://${host}:${port}`);  // rare fallback
-  }
-  // If you *really* want a last-resort, add one of these:
-  // urls.push(`${location.protocol==='https:'?'wss':'ws'}://127.0.0.1:${port}`);
-  return urls;
+function wsURLSameOrigin() {
+  const dev = new URLSearchParams(location.search).get("ws");
+  if (dev) return dev;
+  const proto = (location.protocol === "https:") ? "wss" : "ws";
+      // Nginx exposes the tunnel at /livedepth-ws/
+  return `${proto}://${location.host}/livedepth-ws/`;
 }
 
 function startWSStream(){
   stopWebcam(); stopWS();
 
-  const q=new URLSearchParams(location.search);
-  const port = Number(q.get("port") || 8765);
-  wsURLs = buildWSCandidates(port);
-  wsTry=0;
-  console.log("[viewer] WS candidates (wss first):", wsURLs);
+  let attempt = 0;
+  const backoffBase = 500, backoffMax = 4000;
 
-  const backoffBase=500, backoffMax=4000;
-
-  const tryConnect=()=>{
-    const url = wsURLs[wsTry % wsURLs.length]; wsTry++;
-    const attempt = wsTry;
+  const tryConnect = () => {
+    const url = wsURLSameOrigin();
+    attempt++;
     statusText = `WS connecting ${url} (attempt ${attempt})`;
     overlay.classList.add("error");
-    overlay.textContent=statusText;
-    console.log(`[viewer] trying ${url} (attempt ${attempt})`);
+    overlay.textContent = statusText;
 
     const sock = new WebSocket(url);
-    ws = sock; ws.binaryType="arraybuffer";
+    ws = sock; ws.binaryType = "arraybuffer";
 
-    sock.onopen = ()=>{
-      wsConnected=true; setBarsState();
-      statusText=`connected (${url})`;
+    sock.onopen = () => {
+      wsConnected = true; setBarsState();
+      statusText = `connected (${url})`;
       overlay.classList.remove("error");
-      overlay.textContent=statusText;
-      console.log(`[viewer] connected ${url}`);
-      try{ ws.send(JSON.stringify({cmd:"list_cams"})); }catch{}
+      overlay.textContent = statusText;
+      try { ws.send(JSON.stringify({ cmd:"list_cams" })); } catch {}
+      try { ws.send(JSON.stringify({ cmd:"get_params" })); } catch {}
+
     };
 
-    sock.onmessage=(ev)=>{
-      if (typeof ev.data === "string"){
-        try{
-          const msg=JSON.parse(ev.data);
-          if (msg.type==="cams"){
-            srvSelect.innerHTML="";
-            msg.items.forEach(it=>{ const o=document.createElement("option"); o.value=String(it.index); o.textContent=`[${it.index}] ${it.name}`; srvSelect.appendChild(o); });
-            if (msg.selected != null) srvSelect.value=String(msg.selected);
+    sock.onmessage = (ev) => {
+      if (typeof ev.data === "string") {
+        try {
+          const msg = JSON.parse(ev.data);
+
+          if (msg.type === "cams") {
+            srvSelect.innerHTML = "";
+            msg.items.forEach(it => {
+              const o = document.createElement("option");
+              o.value = String(it.index);
+              o.textContent = `[${it.index}] ${it.name}`;
+              srvSelect.appendChild(o);
+            });
+            if (msg.selected != null) srvSelect.value = String(msg.selected);
             setBarsState();
-          } else if (msg.type==="set_cam_ok"){ srvSelect.value=String(msg.index); }
-          else if (msg.type==="set_cam_err"){ console.warn("Server set_cam failed:", msg.error); }
-        }catch(e){ console.warn("JSON msg parse error", e); }
+
+          } else if (msg.type === "set_cam_ok") {
+            srvSelect.value = String(msg.index);
+
+          } else if (msg.type === "set_cam_err") {
+            console.warn("Server set_cam failed:", msg.error);
+
+      // --- NEW: live server parameter updates ---
+          } else if (msg.type === "params" || msg.type === "params_ok") {
+            if (typeof msg.ema_alpha  === "number") params.serverEmaAlpha  = msg.ema_alpha;
+            if (typeof msg.clamp_near === "number") params.serverClampNear = msg.clamp_near;
+            if (typeof msg.clamp_far  === "number") params.serverClampFar  = msg.clamp_far;
+        // refresh GUI fields without re-triggering onChange
+            try { gServer?.controllers?.forEach?.(c => c.updateDisplay?.()); } catch {}
+
+          } else if (msg.type === "params_err") {
+            console.warn("Server param error:", msg.error);
+          }
+      // --- end NEW ---
+
+        } catch(e) {
+          console.warn("JSON msg parse error", e);
+        }
         return;
       }
+
+  // Binary frame
       const parsed = parseFrame(ev.data);
-      if (parsed.hello){
-        console.log("[viewer] server hello (headerLen=0)");
-        return;
-      }
+      if (parsed.hello) return;
       onNewNetworkFrame(parsed);
     };
 
-    sock.onerror = (e)=>{ console.warn("[viewer] ws error", e); };
 
-    sock.onclose = ()=>{
-      wsConnected=false; setBarsState();
-      const d = Math.min(backoffMax, backoffBase * Math.pow(1.6, Math.min(wsTry,6)));
-      statusText=`DISCONNECTED · retrying in ${Math.round(d)}ms`;
+    sock.onerror = (e) => { console.warn("[viewer] ws error", e); };
+
+    sock.onclose = () => {
+      wsConnected = false; setBarsState();
+      const d = Math.min(backoffMax, backoffBase * Math.pow(1.6, Math.min(attempt, 6)));
+      statusText = `DISCONNECTED · retrying in ${Math.round(d)}ms`;
       overlay.classList.add("error");
-      overlay.textContent=statusText;
-      console.warn(`[viewer] ${url} closed. Backing off ${Math.round(d)}ms`);
-      wsTimer = setTimeout(tryConnect, d);
+      overlay.textContent = statusText;
+      setTimeout(tryConnect, d);
     };
   };
 
@@ -656,31 +1934,325 @@ function onSourceChanged(){
 }
 
 function onNewNetworkFrame(parsed){
-  const { header, depth, rgb } = parsed; const N=header.w*header.h;
-  ensureCloudBuffers(N); lastPos.set(nextPos);
+  const { header, depth, rgb } = parsed;
+  const N = header.w * header.h;
+
+  ensureCloudBuffers(N);
+  lastPos.set(nextPos);                      // keep for BUILD transition
   unprojectInto(nextPos, curCol, header, depth, rgb);
-  cloudGeom.getAttribute('color').needsUpdate=true; lastHeader=header; rebuildGridFromCloud();
-  const now=performance.now(); const inter=Math.min(300,Math.max(30,now-lastArrival)); lastArrival=now;
-  targetTweenMs=0.8*targetTweenMs+0.2*inter; tweenT=0;
-  statusText=`w=${header.w} h=${header.h} | tween≈${Math.round(targetTweenMs)}ms | rain=${RAIN_COUNT}`;
+  cloudGeom.getAttribute('color').needsUpdate = true;
+  lastHeader = header;
+  rebuildGridFromCloud();
+
+  // Update smoothing time-constant (NO tween restart)
+  const now = performance.now();
+  const inter = Math.min(params.tweenMaxMs, Math.max(params.tweenMinMs, now - lastArrival));
+  lastArrival = now;
+
+  if (params.tweenAuto) {
+    const a = params.tweenAlpha;
+    tauMs = (1 - a) * tauMs + a * inter;
+    tauMs = Math.min(params.tweenMaxMs, Math.max(params.tweenMinMs, tauMs));
+  } else {
+    tauMs = params.tweenMs | 0;
+  }
+
+  // First packet: snap and zero spring velocity
+  if (!emaInit && curPos && nextPos && curPos.length === nextPos.length) {
+    curPos.set(nextPos);
+    if (velPos && velPos.length === curPos.length) velPos.fill(0);
+    cloudGeom.getAttribute('position').needsUpdate = true;
+    cloudGeom.computeBoundingSphere();
+    emaInit = true;
+  }
+
+
+  statusText = `w=${header.w} h=${header.h} | τ≈${Math.round(tauMs)}ms | rain=${rainVX ? rainVX.length : 0}`;
 }
+
 
 async function bootstrap(){
   await populateCameraList(false);
-  const hasPort=new URLSearchParams(location.search).has("port");
-  if (hasPort) params.source=SOURCE.PythonWS;
-  if (params.source===SOURCE.PythonWS) startWSStream(); else startWebcamStream(currentCamId);
+      // Always default to PythonWS when served from /livedepth
+  params.source = (location.pathname.startsWith("/livedepth")) ? SOURCE.PythonWS : params.source;
+
+  if (params.source === SOURCE.PythonWS) startWSStream();
+  else startWebcamStream(currentCamId);
+
   setBarsState();
+  tryLoadAutosave();
+
 }
 
-bootstrap(); render();
 
-window.addEventListener('resize', ()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); if (paused) renderer.render(scene,camera); });
+
+// ---------- WebXR Buttons (default styling/placement) ----------
+// document.body.appendChild( XRButton.createButton(renderer, {
+//   optionalFeatures: ['local-floor','bounded-floor','hand-tracking','layers']
+// }) );
+
+// document.body.appendChild( ARButton.createButton(renderer, {
+//   requiredFeatures: ['local-floor'],
+//   optionalFeatures: []
+// }) );
+
+
+
+// create hands
+const handFactory = new XRHandModelFactory();
+
+const hand0 = renderer.xr.getHand(0);
+hand0.add(handFactory.createHandModel(hand0, 'mesh')); // 'mesh' | 'spheres' | 'boxes'
+scene.add(hand0);
+
+const hand1 = renderer.xr.getHand(1);
+hand1.add(handFactory.createHandModel(hand1, 'mesh'));
+scene.add(hand1);
+
+
+// AR
+document.body.appendChild( ARButton.createButton(renderer, {
+  requiredFeatures: ['local-floor'],
+  optionalFeatures: ['hand-tracking']   // <-- add this
+}) );
+
+// VR
+document.body.appendChild( XRButton.createButton(renderer, {
+  optionalFeatures: ['local-floor','bounded-floor','hand-tracking','layers']
+}) );
+
+
+
+    // Controllers: trigger cycles transitions
+const controllerModelFactory = new XRControllerModelFactory();
+const ctrl0 = renderer.xr.getController(0);
+const ctrl1 = renderer.xr.getController(1);
+scene.add(ctrl0, ctrl1);
+
+const grip0 = renderer.xr.getControllerGrip(0);
+const grip1 = renderer.xr.getControllerGrip(1);
+grip0.add(controllerModelFactory.createControllerModel(grip0));
+grip1.add(controllerModelFactory.createControllerModel(grip1));
+
+scene.add(grip0, grip1);
+
+    let triggerState = 0; // 0→Build, 1→Dissolve, 2→Reset, then repeat
+    const cycleTransitions = ()=>{
+      if (triggerState===0){ startBuild(); }
+      else if (triggerState===1){ startDissolve(); }
+      else { resetTransition(); }
+      triggerState = (triggerState+1)%3;
+    };
+    ctrl0.addEventListener('selectstart', cycleTransitions);
+    ctrl1.addEventListener('selectstart', cycleTransitions);
+
+    // XR session start/end: placement & material tweaks
+    renderer.xr.addEventListener('sessionstart', ()=>{
+
+
+      controls.enabled = false;
+
+      const s = renderer.xr.getSession();
+      const blend = s?.environmentBlendMode || 'opaque';
+      const isAR = (blend !== 'opaque');
+
+      if (isAR){
+        // Transparent background over passthrough
+        scene.background = null;
+        renderer.setClearAlpha(0);
+
+        // Place the cloud in front, slightly down, and scale smaller
+        cloudGroup.position.set(0, params.xrYOffset, -params.xrDistance);
+        cloudGroup.scale.setScalar(params.xrScale);
+
+        // Points: screen-space sizing for crispness over camera feed
+        cloudMaterial.sizeAttenuation = false;
+        cloudMaterial.size = Math.max(params.pointSize, params.xrPointPixelSize);
+        cloudMaterial.blending = THREE.NormalBlending;
+        cloudMaterial.needsUpdate = true;
+
+        // Hide VR floor/grid in AR
+        floorGrid.visible = false;
+      } else {
+        // VR room: solid background, world-space size
+        scene.background = new THREE.Color(0x000000);
+        renderer.setClearAlpha(1);
+
+        cloudGroup.position.set(0, 0, -1.2);
+        cloudGroup.scale.setScalar(1);
+
+        cloudMaterial.sizeAttenuation = true;
+        cloudMaterial.size = params.pointSize;
+        cloudMaterial.blending = THREE.AdditiveBlending;
+        cloudMaterial.needsUpdate = true;
+
+        floorGrid.visible = true;
+      }
+
+      updateExternalPointMaterials(); 
+    });
+
+    renderer.xr.addEventListener('sessionend', ()=>{
+      controls.enabled = true;
+      scene.background = new THREE.Color(0x000000);
+      renderer.setClearAlpha(1);
+
+      // Restore desktop placement
+      cloudGroup.position.set(0,0,0);
+      cloudGroup.scale.setScalar(1);
+
+      cloudMaterial.sizeAttenuation = true;
+      cloudMaterial.size = params.pointSize;
+      cloudMaterial.blending = THREE.NormalBlending;
+      cloudMaterial.needsUpdate = true;
+
+      floorGrid.visible = true;
+
+      updateExternalPointMaterials(); 
+
+    });
+
+    // ---------- Boot ----------
+    bootstrap();
+
+
+// --- NEW BLOCK: Drag & Drop + File input loader ---
+    const gltfLoader = new GLTFLoader();
+
+    // DRACO support (GLB/GLTF with KHR_draco_mesh_compression)
+    const dracoLoader = new DRACOLoader();
+
+    // Use Google's hosted decoder (fast + cached). Path must end with '/'
+    dracoLoader.setDecoderPath("https://www.gstatic.com/draco/v1/decoders/");
+    dracoLoader.setWorkerLimit(2);          // optional, keeps CPU sane
+    // (Optional) prefer WASM explicitly:
+    // dracoLoader.setDecoderConfig({ type: "wasm" });
+
+    gltfLoader.setDRACOLoader(dracoLoader);
+
+
+    btnLoad?.addEventListener('click', () => fileInput.click(), { passive:true });
+    fileInput?.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files || []);
+      for (const f of files) await loadModelFile(f);
+        fileInput.value = "";
+    }, { passive:true });
+
+    window.addEventListener('dragover', (e)=>{
+      e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+      dropHint?.classList.add('show');
+    });
+    window.addEventListener('dragleave', (e)=>{
+      if (e.target === document || e.target === document.body) dropHint?.classList.remove('show');
+    });
+    window.addEventListener('drop', async (e)=>{
+      e.preventDefault(); dropHint?.classList.remove('show');
+      const files = Array.from(e.dataTransfer.files || []);
+      for (const f of files) await loadModelFile(f);
+    });
+
+    async function loadModelFile(file) {
+      const name = file.name.replace(/\.(glb|gltf)$/i,'');
+      const isGLB = /\.glb$/i.test(file.name);
+      const arrayBuf = await file.arrayBuffer();
+
+      await new Promise((resolve, reject)=>{
+        try {
+          if (isGLB) {
+            gltfLoader.parse(arrayBuf, '', (gltf)=>{
+              const rec = gltfToPoints(gltf, { name, density: 1.0 });
+              addExternalGroup(rec);
+              resolve();
+            }, reject);
+          } else {
+        // Attempt to parse embedded .gltf (external refs not supported here)
+            const text = new TextDecoder().decode(new Uint8Array(arrayBuf));
+            gltfLoader.parse(text, '', (gltf)=>{
+              const rec = gltfToPoints(gltf, { name, density: 1.0 });
+              addExternalGroup(rec);
+              resolve();
+            }, reject);
+          }
+        } catch (err) { reject(err); }
+      }).catch(err=>{
+        console.error("[viewer] Failed to load model:", err);
+        overlay.classList.add("error");
+        overlay.textContent = `Model load error: ${err?.message || err}`;
+        setTimeout(()=> overlay.textContent = statusText, 2000);
+      });
+    }
+// --- END NEW BLOCK ---
+
+
+// --- NEW BLOCK: Models GUI panel (list each external point cloud) ---
+    const gModels = gui.addFolder("Models");
+let gModelsFolders = []; // per-group folders to destroy on rebuild
+const modelGUIState = {
+  transformMode: "translate" // or "rotate" / "scale"
+};
+gModels.add(modelGUIState, "transformMode", ["translate","rotate","scale"])
+.name("Gizmo Mode")
+.onChange(mode => tControls.setMode(mode));
+
+function rebuildGroupsGUI() {
+  // Cleanup old
+  gModelsFolders.forEach(f => { try{ gModels.removeFolder?.(f); }catch{} });
+  gModelsFolders = [];
+
+  // Create a subfolder per group
+  externalGroups.forEach(rec => {
+    const f = gModels.addFolder(`[${rec.id}] ${rec.name}`);
+    gModelsFolders.push(f);
+
+    // visibility + selection
+    const visCtrl = f.add(rec, "visible").name("Visible").onChange(v => { rec.group.visible = v; });
+    f.add({ select: ()=> selectExternalGroup(rec.id) }, "select").name("Select");
+
+    // density 0..1
+    f.add(rec, "density", 0.01, 1.0, 0.01).name("Density").onChange(v => resampleGroupDensity(rec, v));
+
+    // transforms
+    const pos = { x: rec.group.position.x, y: rec.group.position.y, z: rec.group.position.z };
+    const rot = { x: THREE.MathUtils.radToDeg(rec.group.rotation.x),
+      y: THREE.MathUtils.radToDeg(rec.group.rotation.y),
+      z: THREE.MathUtils.radToDeg(rec.group.rotation.z) };
+      const scl = { s: rec.group.scale.x };
+
+      f.add(pos, "x", -5, 5, 0.01).name("Pos X").onChange(v=> rec.group.position.x = v);
+      f.add(pos, "y", -5, 5, 0.01).name("Pos Y").onChange(v=> rec.group.position.y = v);
+      f.add(pos, "z", -5, 5, 0.01).name("Pos Z").onChange(v=> rec.group.position.z = v);
+
+      f.add(rot, "x", -180, 180, 1).name("Rot X°").onChange(v=> rec.group.rotation.x = THREE.MathUtils.degToRad(v));
+      f.add(rot, "y", -180, 180, 1).name("Rot Y°").onChange(v=> rec.group.rotation.y = THREE.MathUtils.degToRad(v));
+      f.add(rot, "z", -180, 180, 1).name("Rot Z°").onChange(v=> rec.group.rotation.z = THREE.MathUtils.degToRad(v));
+
+      f.add(scl, "s", 0.01, 10, 0.01).name("Uniform Scale").onChange(v=> rec.group.scale.setScalar(v));
+
+    // remove
+      f.add({ remove: ()=>{
+        if (selectedGroupId === rec.id) { tControls.detach(); selectedGroupId = null; }
+        cloudGroup.remove(rec.group);
+        rec.points.geometry.dispose(); rec.material.dispose();
+        externalGroups = externalGroups.filter(g => g.id !== rec.id);
+        rebuildGroupsGUI();
+      }}, "remove").name("Remove");
+    });
+}
+// --- END NEW BLOCK ---
+
+
+
+    // Resize
+window.addEventListener('resize', ()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  if (paused) renderer.render(scene,camera);
+});
+
 window.addEventListener("beforeunload", ()=>{ stopWS(); stopWebcam(); });
 </script>
 
+<!-- <script src="https://immersive-collective.org/projects/ic-badge/ic.js"></script> -->
 
-
-<script src="https://immersive-collective.org/projects/ic-badge/ic.js"></script>
 </body>
 </html>

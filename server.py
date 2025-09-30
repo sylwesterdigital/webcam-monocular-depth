@@ -29,12 +29,18 @@ STRIDE       = int(os.getenv("STRIDE", "2"))         # 1=full res; 2/3 reduces p
 FOV_DEG      = float(os.getenv("FOV_DEG", "60.0"))
 PORT         = int(os.getenv("PORT", "8765"))
 BIND_HOST    = os.getenv("BIND_HOST", "localhost")   # <— no hardcoded IP; matches page host
+
 MODEL_TYPE   = os.getenv("MODEL_TYPE", "MiDaS_small")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
+#MODEL_TYPE   = os.getenv("MODEL_TYPE", "DPT_Hybrid")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
+#MODEL_TYPE   = os.getenv("MODEL_TYPE", "DPT_Large")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
+
 EMA_ALPHA    = float(os.getenv("EMA_ALPHA", "0.2"))
 CLAMP_NEAR   = float(os.getenv("CLAMP_NEAR", "0.2"))
-CLAMP_FAR    = float(os.getenv("CLAMP_FAR",  "4.0"))
+CLAMP_FAR    = float(os.getenv("CLAMP_FAR",  "1.0"))
+
 TEST_PATTERN = bool(int(os.getenv("TEST_PATTERN", "0")))  # 1 = synthetic pattern
 LOG_EVERY_SEC= float(os.getenv("LOG_EVERY_SEC", "2.0"))
+
 LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # TLS
@@ -141,6 +147,23 @@ def resolve_webcam_index(name_pref: str, fallback_index: int) -> int:
             return idx
     log.warning(f"WEBCAM_NAME='{name_pref}' not found. Using WEBCAM_INDEX={fallback_index}.")
     return fallback_index
+
+
+def _clamp_params(ema, near_, far_):
+    # guardrails and defaults
+    ema  = float(ema)  if ema  is not None else EMA_ALPHA
+    near_= float(near_) if near_ is not None else CLAMP_NEAR
+    far_ = float(far_)  if far_  is not None else CLAMP_FAR
+    # fix ordering if needed
+    if far_ <= near_:
+        far_ = near_ + 1e-3
+    # bounds you like (optional)
+    ema   = max(0.0, min(1.0, ema))
+    near_ = max(0.0, near_)
+    far_  = max(near_ + 1e-3, far_)
+    return ema, near_, far_
+
+
 
 # ---------- Model (skipped if TEST_PATTERN) ----------
 if not TEST_PATTERN:
@@ -292,6 +315,7 @@ async def control_loop(ws):
             data = json.loads(msg)
         except Exception:
             continue
+
         cmd = data.get("cmd")
         if cmd == "list_cams":
             await send_json(ws, {"type":"cams","items":camera_listing(),"selected":resolved_index})
@@ -304,9 +328,43 @@ async def control_loop(ws):
             except Exception as e:
                 await send_json(ws, {"type":"set_cam_err","error":str(e)})
 
+        # --- NEW: live server params ---
+        elif cmd == "get_params":
+            await send_current_params(ws)
+
+        elif cmd == "set_params":
+            global EMA_ALPHA, CLAMP_NEAR, CLAMP_FAR
+            try:
+                ema  = data.get("ema_alpha", None)
+                near_= data.get("clamp_near", None)
+                far_ = data.get("clamp_far",  None)
+                ema, near_, far_ = _clamp_params(ema, near_, far_)
+                EMA_ALPHA  = ema
+                CLAMP_NEAR = near_
+                CLAMP_FAR  = far_
+                await send_json(ws, {
+                    "type":"params_ok",
+                    "ema_alpha": EMA_ALPHA,
+                    "clamp_near": CLAMP_NEAR,
+                    "clamp_far": CLAMP_FAR
+                })
+            except Exception as e:
+                await send_json(ws, {"type":"params_err","error":str(e)})
+
+
+
+async def send_current_params(ws):
+    await send_json(ws, {
+        "type": "params",
+        "ema_alpha": EMA_ALPHA,
+        "clamp_near": CLAMP_NEAR,
+        "clamp_far": CLAMP_FAR
+    })
+
 async def handler(websocket):
     # hello (header length == 0)
     await websocket.send(struct.pack("<I", 0))
+    await send_current_params(websocket)
     producer = asyncio.create_task(frame_stream(websocket))
     consumer = asyncio.create_task(control_loop(websocket))
     done, pending = await asyncio.wait({producer, consumer}, return_when=asyncio.FIRST_EXCEPTION)
