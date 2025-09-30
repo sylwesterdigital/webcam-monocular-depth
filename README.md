@@ -41,7 +41,7 @@ It runs locally, requires no cloud connection, and packages into a standalone `.
 ### 1. Clone and set up environment
 
 ```
-git clone https://github.com/yourname/webcam-monocular-depth
+git clone https://github.com/sylwesterdigital/webcam-monocular-depth
 cd webcam-monocular-depth
 python3 -m venv .venv
 source .venv/bin/activate
