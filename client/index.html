@@ -372,358 +372,508 @@
   }
 
 
-  const gSmooth = gui.addFolder("Smoothing");
-  gSmooth.add(params, "tweenAuto").name("Auto smoothing");
-  gSmooth.add(params, "tweenMs", 10, 800, 1).name("Manual τ (ms)")
-  .onChange(v => { if (!params.tweenAuto) tauMs = (v|0); });
-  gSmooth.add(params, "tweenMinMs", 10, 800, 1).name("Auto min τ");
-  gSmooth.add(params, "tweenMaxMs", 30, 1000, 1).name("Auto max τ");
-  gSmooth.add(params, "tweenAlpha", 0.05, 0.8, 0.01).name("Auto EMA α");
+
+
+// --- HANDS & HAND STEAM (unit-safe) -----------------------------------------
+// Forward declarations so early helpers (like syncComputedHandSizes) can touch these safely
+  let hand0Points = null;
+  let hand1Points = null;
+let handSteamMat = null;   // used by applyHandSteamSize() and rebuildHandSteam()
+
+
+// helpers (local to this block)
+function isARSession(){
+  const s = renderer.xr.getSession();
+  return !!s && (s.environmentBlendMode !== 'opaque');
+}
+function applyHandPointSizeTo(mat){
+  const ar = isARSession();
+  mat.sizeAttenuation = !ar; // AR: pixels, VR/Desktop: meters
+  mat.size = ar ? params.handPointSizePx : params.handPointSizeWorld;
+  mat.needsUpdate = true;
+}
+function applyHandSteamSize(){
+  if (!handSteamMat) return;
+  const ar = isARSession();
+  handSteamMat.sizeAttenuation = !ar; // AR: pixels, VR/Desktop: meters
+  handSteamMat.size = ar ? params.handSteamSizePx : params.handSteamSizeWorld;
+  handSteamMat.needsUpdate = true;
+}
+function syncComputedHandSizes(){
+  // keep legacy fields updated so existing code that reads params.handPointSize / handSteamSize keeps working
+  const ar = isARSession();
+  params.handPointSize = ar ? params.handPointSizePx : params.handPointSizeWorld;
+  params.handSteamSize = ar ? params.handSteamSizePx : params.handSteamSizeWorld;
+
+  // push to live materials if they exist
+  if (hand0Points?.material) applyHandPointSizeTo(hand0Points.material);
+  if (hand1Points?.material) applyHandPointSizeTo(hand1Points.material);
+  applyHandSteamSize();
+}
+
+// -------------------- HANDS (params + GUI) --------------------
+Object.assign(params, {
+  handClusterCount: 12,
+  handClusterRadius: 0.012,
+
+  // NEW: dual-unit sizing + legacy mirror
+  handPointSizePx: 4.0,       // AR: pixels
+  handPointSizeWorld: 0.02,   // VR/Desktop: meters
+  handPointSize: 0.02,        // legacy (auto-updated via syncComputedHandSizes)
+
+  handBrightness: 1.2
+});
+
+const gHands = gui.addFolder("Hands");
+gHands.add(params, "handClusterCount", 1, 60, 1).name("Density (pts/joint)")
+.onChange(()=> rebuildHandPoints());
+gHands.add(params, "handClusterRadius", 0.002, 0.04, 0.001).name("Cluster Radius (m)");
+
+// NEW: two sliders, no more direct use of legacy size in GUI
+gHands.add(params, "handPointSizePx", 0.5, 20, 0.1).name("Point Size (px)")
+.onChange(()=> syncComputedHandSizes());
+gHands.add(params, "handPointSizeWorld", 0.001, 0.1, 0.001).name("Point Size (m)")
+.onChange(()=> syncComputedHandSizes());
+
+gHands.add(params, "handBrightness", 0.5, 3.0, 0.05).name("Brightness").onChange(()=>{
+  [hand0Points, hand1Points].forEach(pts=>{
+    const col = pts?.geometry?.getAttribute('color'); if (!col) return;
+    const a = col.array; for (let i=0;i<a.length;i++) a[i] = Math.min(1, a[i]); // re-brighten in update loop
+    col.needsUpdate = true;
+  });
+});
+
+// -------------------- HAND STEAM (params + GUI) --------------------
+Object.assign(params, {
+  handSteamEnabled: true,
+  handSteamCount: 11000,
+
+  // NEW: dual-unit sizing + legacy mirror
+  handSteamSizePx: 3.0,        // AR: pixels
+  handSteamSizeWorld: 0.006,   // VR/Desktop: meters
+  handSteamSize: 0.006,        // legacy (auto-updated via syncComputedHandSizes)
+
+  handSteamBirthsPerFrame: 400,
+  handSteamUpVel: 0.6,
+  handSteamSpread: 0.005,
+  handSteamDrag: 0.6,
+  handSteamColor: [0.85, 0.9, 1.0],
+
+  handSteamAttractEnabled: true,
+  handSteamAttractStrength: 5.5,
+  handSteamAttractMax: 0.55
+});
+
+const gSteam = gui.addFolder("Hand Steam");
+gSteam.add(params, "handSteamEnabled").name("Enabled").onChange(v=>{
+  if (handSteamPoints) handSteamPoints.visible = !!v;
+});
+gSteam.add(params, "handSteamCount", 0, 20000, 100).name("Count")
+.onChange(v=> rebuildHandSteam(v|0));
+
+// NEW: two sliders, legacy value kept in sync
+gSteam.add(params, "handSteamSizePx", 0.5, 20, 0.1).name("Point Size (px)")
+.onChange(()=> syncComputedHandSizes());
+gSteam.add(params, "handSteamSizeWorld", 0.001, 0.05, 0.001).name("Point Size (m)")
+.onChange(()=> syncComputedHandSizes());
+
+gSteam.add(params, "handSteamBirthsPerFrame", 0, 5000, 10).name("Births / frame");
+gSteam.add(params, "handSteamUpVel", 0.0, 2.0, 0.01).name("Upward m/s");
+gSteam.add(params, "handSteamSpread", 0.001, 0.06, 0.001).name("Spawn Spread (m)");
+gSteam.add(params, "handSteamDrag", 0.0, 4.0, 0.01).name("Drag (1/s)");
+
+const gSteamAttr = gSteam.addFolder("Attractor");
+gSteamAttr.add(params, "handSteamAttractEnabled").name("Enabled")
+.onChange(v=>{ if (attractorSphere) attractorSphere.visible = !!v; });
+gSteamAttr.add(params, "handSteamAttractStrength", 0.0, 12.0, 0.1).name("Strength");
+gSteamAttr.add(params, "handSteamAttractMax", 0.05, 2.5, 0.01).name("Max Distance (m)");
+
+// initialize legacy mirrors & materials once
+syncComputedHandSizes();
+
+
+
+
+const gSmooth = gui.addFolder("Smoothing");
+gSmooth.add(params, "tweenAuto").name("Auto smoothing");
+gSmooth.add(params, "tweenMs", 10, 800, 1).name("Manual τ (ms)")
+.onChange(v => { if (!params.tweenAuto) tauMs = (v|0); });
+gSmooth.add(params, "tweenMinMs", 10, 800, 1).name("Auto min τ");
+gSmooth.add(params, "tweenMaxMs", 30, 1000, 1).name("Auto max τ");
+gSmooth.add(params, "tweenAlpha", 0.05, 0.8, 0.01).name("Auto EMA α");
 // We ignore tweenEasing for live smoothing; keep it for BUILD transitions if you want:
-  gSmooth.add(params, "tweenEasing", ["linear","easeIn","easeOut","easeInOut","smoothstep","smootherstep"])
-  .name("Build easing");
-  gSmooth.open();
+gSmooth.add(params, "tweenEasing", ["linear","easeIn","easeOut","easeInOut","smoothstep","smootherstep"])
+.name("Build easing");
+gSmooth.open();
 
 
 
 
 
-  const gXR = gui.addFolder("XR Placement");
-  gXR.add(params, "xrScale", 0.05, 1.0, 0.01).name("Scale");
-  gXR.add(params, "xrDistance", 0.4, 3.0, 0.05).name("Distance");
-  gXR.add(params, "xrYOffset", -1.0, 1.0, 0.02).name("Y Offset");
-  gXR.add(params, "xrPointPixelSize", 0.005, 0.05, 0.001).name("AR Point px");
+const gXR = gui.addFolder("XR Placement");
+gXR.add(params, "xrScale", 0.05, 1.0, 0.01).name("Scale");
+gXR.add(params, "xrDistance", 0.4, 3.0, 0.05).name("Distance");
+gXR.add(params, "xrYOffset", -1.0, 1.0, 0.02).name("Y Offset");
+gXR.add(params, "xrPointPixelSize", 0.005, 0.05, 0.001).name("AR Point px");
 
 
 
 // --- PRESETS GUI -------------------------------------------------------------
-  const presetFile = document.getElementById("presetFile");
+const presetFile = document.getElementById("presetFile");
 
-  const presetState = {
-    selected: "",
-    nameToSave: "",
-  };
+const presetState = {
+  selected: "",
+  nameToSave: "",
+};
 
-  const gPresets = gui.addFolder("Presets");
+const gPresets = gui.addFolder("Presets");
 
 // We'll recreate this controller whenever the list changes
-  let presetCtrl = null;
+let presetCtrl = null;
 
-  function buildPresetController(names) {
+function buildPresetController(names) {
   // Destroy old controller safely (lil-gui API)
-    if (presetCtrl) {
-      presetCtrl.destroy();
-      presetCtrl = null;
-    }
-
-  // Map array -> options object { "name":"name", ... } for a select control
-    const opts = names.reduce((acc, n) => (acc[n] = n, acc), {});
-    presetCtrl = gPresets.add(presetState, "selected", opts).name("Select");
-
-  // Auto-load on change
-    presetCtrl.onChange(async (name) => {
-      if (!name) return;
-      const st = await idbGetPreset(name);
-      if (st) {
-        applyState(st);
-        scheduleAutosave();
-      }
-    });
+  if (presetCtrl) {
+    presetCtrl.destroy();
+    presetCtrl = null;
   }
 
-  gPresets.add(presetState, "nameToSave").name("Name");
+  // Map array -> options object { "name":"name", ... } for a select control
+  const opts = names.reduce((acc, n) => (acc[n] = n, acc), {});
+  presetCtrl = gPresets.add(presetState, "selected", opts).name("Select");
 
-  const refreshPresetList = async () => {
-    const list  = await idbListPresets();
-    const names = list.map(p => p.name).sort((a, b) => a.localeCompare(b));
-
-  // keep selection if possible
-    if (!names.includes(presetState.selected)) {
-      presetState.selected = names[0] || "";
-    }
-
-  // Rebuild the controller with the new options (avoids NotFoundError)
-    buildPresetController(names);
-  };
-
-  gPresets.add({ Save: async () => {
-    const name = (presetState.nameToSave || presetState.selected || "").trim();
-    if (!name) { alert("Enter a preset name."); return; }
-    await idbPutPreset(name, currentState());
-    presetState.selected   = name;
-    presetState.nameToSave = "";
-    await refreshPresetList();
-  }}, "Save");
-
-  gPresets.add({ Load: async () => {
-    if (!presetState.selected) { alert("Choose a preset."); return; }
-    const st = await idbGetPreset(presetState.selected);
-    if (!st) { alert("Preset missing."); return; }
-    applyState(st);
-    scheduleAutosave();
-  }}, "Load");
-
-  gPresets.add({ Delete: async () => {
-    if (!presetState.selected) { alert("Choose a preset."); return; }
-    if (!confirm(`Delete preset "${presetState.selected}"?`)) return;
-    await idbDeletePreset(presetState.selected);
-    presetState.selected = "";
-    await refreshPresetList();
-  }}, "Delete");
-
-  gPresets.add({ Export: () => {
-    const name = presetState.selected || presetState.nameToSave || "preset";
-    const blob = new Blob([ JSON.stringify(currentState(), null, 2) ], { type:"application/json" });
-    saveBlob(blob, `${name.replace(/[^\w.-]+/g,'_')}.json`);
-  }}, "Export");
-
-  gPresets.add({ Import: () => presetFile?.click() }, "Import");
-
-// Handle Import file select (unchanged)
-  presetFile?.addEventListener("change", async (e) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    try {
-      const txt = await f.text();
-      const st  = JSON.parse(txt);
-      let name  = prompt("Preset name to save as:", (st?.presetName || f.name.replace(/\.json$/i,'') || "Imported"));
-      if (!name) return;
-      await idbPutPreset(name, st);
-      presetState.selected = name;
-      await refreshPresetList();
+  // Auto-load on change
+  presetCtrl.onChange(async (name) => {
+    if (!name) return;
+    const st = await idbGetPreset(name);
+    if (st) {
       applyState(st);
       scheduleAutosave();
-    } catch (err) {
-      alert("Import failed: " + (err?.message || err));
-    } finally {
-      e.target.value = "";
     }
   });
+}
+
+gPresets.add(presetState, "nameToSave").name("Name");
+
+const refreshPresetList = async () => {
+  const list  = await idbListPresets();
+  const names = list.map(p => p.name).sort((a, b) => a.localeCompare(b));
+
+  // keep selection if possible
+  if (!names.includes(presetState.selected)) {
+    presetState.selected = names[0] || "";
+  }
+
+  // Rebuild the controller with the new options (avoids NotFoundError)
+  buildPresetController(names);
+};
+
+gPresets.add({ Save: async () => {
+  const name = (presetState.nameToSave || presetState.selected || "").trim();
+  if (!name) { alert("Enter a preset name."); return; }
+  await idbPutPreset(name, currentState());
+  presetState.selected   = name;
+  presetState.nameToSave = "";
+  await refreshPresetList();
+}}, "Save");
+
+gPresets.add({ Load: async () => {
+  if (!presetState.selected) { alert("Choose a preset."); return; }
+  const st = await idbGetPreset(presetState.selected);
+  if (!st) { alert("Preset missing."); return; }
+  applyState(st);
+  scheduleAutosave();
+}}, "Load");
+
+gPresets.add({ Delete: async () => {
+  if (!presetState.selected) { alert("Choose a preset."); return; }
+  if (!confirm(`Delete preset "${presetState.selected}"?`)) return;
+  await idbDeletePreset(presetState.selected);
+  presetState.selected = "";
+  await refreshPresetList();
+}}, "Delete");
+
+gPresets.add({ Export: () => {
+  const name = presetState.selected || presetState.nameToSave || "preset";
+  const blob = new Blob([ JSON.stringify(currentState(), null, 2) ], { type:"application/json" });
+  saveBlob(blob, `${name.replace(/[^\w.-]+/g,'_')}.json`);
+}}, "Export");
+
+gPresets.add({ Import: () => presetFile?.click() }, "Import");
+
+// Handle Import file select (unchanged)
+presetFile?.addEventListener("change", async (e) => {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  try {
+    const txt = await f.text();
+    const st  = JSON.parse(txt);
+    let name  = prompt("Preset name to save as:", (st?.presetName || f.name.replace(/\.json$/i,'') || "Imported"));
+    if (!name) return;
+    await idbPutPreset(name, st);
+    presetState.selected = name;
+    await refreshPresetList();
+    applyState(st);
+    scheduleAutosave();
+  } catch (err) {
+    alert("Import failed: " + (err?.message || err));
+  } finally {
+    e.target.value = "";
+  }
+});
 
 // initial list
-  refreshPresetList();
-  gPresets.open();
+refreshPresetList();
+gPresets.open();
 
 
 
 
 
 // --- STATE: capture/apply ----------------------------------------------------
-  function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
+function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
 
-  function currentState(){
+function currentState(){
   // What we persist:
   // - camera & orbit target
   // - all tweakable params (including server* + rain + smoothing + XR placement + color/points/fade)
   // - selection of source, current browser cam id, server cam index (UI reads it)
   // - external model transforms (by id & name) but NOT heavy geometry
-    const models = externalGroups.map(g => ({
-      id: g.id, name: g.name, visible: g.visible, density: g.density,
-      t: { x:g.group.position.x, y:g.group.position.y, z:g.group.position.z },
-      r: { x:g.group.rotation.x, y:g.group.rotation.y, z:g.group.rotation.z },
-      s: g.group.scale.x
-    }));
-    return {
-      version: 1,
-      camera: {
-        position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
-        target:   { x: controls.target.x, y: controls.target.y, z: controls.target.z },
-        fov: camera.fov,
-      },
-      ui: {
-        source: params.source,
-        browserCamId: currentCamId || "",
-        serverSelectedIndex: srvSelect?.value ?? null,
-      },
-      params: clone(params),
-      models
-    };
-  }
+  const models = externalGroups.map(g => ({
+    id: g.id, name: g.name, visible: g.visible, density: g.density,
+    t: { x:g.group.position.x, y:g.group.position.y, z:g.group.position.z },
+    r: { x:g.group.rotation.x, y:g.group.rotation.y, z:g.group.rotation.z },
+    s: g.group.scale.x
+  }));
+  return {
+    version: 1,
+    camera: {
+      position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+      target:   { x: controls.target.x, y: controls.target.y, z: controls.target.z },
+      fov: camera.fov,
+    },
+    ui: {
+      source: params.source,
+      browserCamId: currentCamId || "",
+      serverSelectedIndex: srvSelect?.value ?? null,
+    },
+    params: clone(params),
+    models
+  };
+}
 
-  function applyState(state, { silent = false } = {}) {
-    try {
-      if (!state) return;
+
+
+
+
+function applyState(state, { silent = false } = {}) {
+  try {
+    if (!state) return;
 
     // --- Camera + orbit target ---
-      if (state.camera) {
-        const p = state.camera.position || {};
-        const t = state.camera.target   || {};
-        if (Number.isFinite(p.x)) camera.position.set(p.x, p.y, p.z);
-        if (Number.isFinite(t.x)) controls.target.set(t.x, t.y, t.z);
-        if (Number.isFinite(state.camera.fov)) {
-          camera.fov = state.camera.fov;
-          camera.updateProjectionMatrix();
-        }
-        controls.update();
+    if (state.camera) {
+      const p = state.camera.position || {};
+      const t = state.camera.target   || {};
+      if (Number.isFinite(p.x)) camera.position.set(p.x, p.y, p.z);
+      if (Number.isFinite(t.x)) controls.target.set(t.x, t.y, t.z);
+      if (Number.isFinite(state.camera.fov)) {
+        camera.fov = state.camera.fov;
+        camera.updateProjectionMatrix();
       }
+      controls.update();
+    }
 
     // --- Params (only keys that exist) ---
-      if (state.params) {
-        Object.keys(state.params).forEach(k => {
-          if (k in params) params[k] = state.params[k];
-        });
+    if (state.params) {
+      Object.keys(state.params).forEach(k => {
+        if (k in params) params[k] = state.params[k];
+      });
 
-// Refresh materials / uniforms / GUI displays
-        setPointShape();
-        updateDepthFadeAll();
-        try { gui.controllersRecursive?.forEach?.(c => c.updateDisplay?.()); } catch {}
-        try { gServer?.controllers?.forEach?.(c => c.updateDisplay?.()); } catch {}
+      // Refresh materials / uniforms / GUI displays
+      setPointShape();
+      updateDepthFadeAll();
+      try { gui.controllersRecursive?.forEach?.(c => c.updateDisplay?.()); } catch {}
+      try { gServer?.controllers?.forEach?.(c => c.updateDisplay?.()); } catch {}
 
-// Make sure the point size from the preset applies immediately
-        cloudMaterial.size = params.pointSize;
-        cloudMaterial.needsUpdate = true;
+      // Main cloud size from preset
+      cloudMaterial.size = params.pointSize;
+      cloudMaterial.needsUpdate = true;
 
-// Keep external point clouds in sync with current params
-        updateExternalPointMaterials();
+      // External point clouds keep in sync with current params
+      updateExternalPointMaterials();
 
+      // ---------- HANDS + HAND STEAM (make presets stick) ----------
+      // Make legacy mirrors match current session (AR vs VR) first,
+      // then push sizes into materials.
+      syncComputedHandSizes();
+
+      if (hand0Points?.material) applyHandPointSizeTo(hand0Points.material);
+      if (hand1Points?.material) applyHandPointSizeTo(hand1Points.material);
+
+      // Rebuild steam count if needed; otherwise just reapply size/visibility
+      const wantSteamCount = (params.handSteamCount | 0);
+      if (typeof wantSteamCount === "number" && hsLife && hsLife.length !== wantSteamCount) {
+        rebuildHandSteam(wantSteamCount);
+      }
+      // Ensure material sizing and visibility match the preset
+      applyHandSteamSize();
+      if (handSteamPoints) handSteamPoints.visible = !!params.handSteamEnabled;
+
+      // Attractor visibility follows the toggle
+      if (typeof attractorSphere !== "undefined" && attractorSphere) {
+        attractorSphere.visible = !!params.handSteamAttractEnabled;
+      }
+      // -------------------------------------------------------------
 
       // If server parameters were restored, send them up
-        pushServerParams();
+      pushServerParams();
 
       // --- APPLY RAIN SETTINGS FROM PRESET ---
-        (()=>{
+      (() => {
         // 1) Count → ensure buffers match
-          const wantCount = (params.rainCount | 0);
-          if (!rainVX || rainVX.length !== wantCount) {
-            rebuildRain(wantCount);
-          }
+        const wantCount = (params.rainCount | 0);
+        if (!rainVX || rainVX.length !== wantCount) {
+          rebuildRain(wantCount);
+        }
 
         // 2) Size → update material
-          if (rainMat) {
-            rainMat.size = params.rainSize;
-            rainMat.needsUpdate = true;
-          }
+        if (rainMat) {
+          rainMat.size = params.rainSize;
+          rainMat.needsUpdate = true;
+        }
 
         // 3) Speed → scale existing velocities so it takes effect immediately
-          if (rainVX && typeof params.rainSpeed === "number") {
-            const prev = (gRain && gRain.__prevSpeed) ? gRain.__prevSpeed : 1;
-            if (prev > 0 && prev !== params.rainSpeed) {
-              const scale = params.rainSpeed / prev;
-              for (let i = 0; i < rainVX.length; i++) {
-                rainVX[i] *= scale; rainVY[i] *= scale; rainVZ[i] *= scale;
-              }
+        if (rainVX && typeof params.rainSpeed === "number") {
+          const prev = (gRain && gRain.__prevSpeed) ? gRain.__prevSpeed : 1;
+          if (prev > 0 && prev !== params.rainSpeed) {
+            const scale = params.rainSpeed / prev;
+            for (let i = 0; i < rainVX.length; i++) {
+              rainVX[i] *= scale; rainVY[i] *= scale; rainVZ[i] *= scale;
             }
-            if (gRain) gRain.__prevSpeed = params.rainSpeed;
           }
-        })();
+          if (gRain) gRain.__prevSpeed = params.rainSpeed;
+        }
+      })();
       // --- END RAIN SETTINGS ---
-      }
+    }
 
     // --- Source & cameras ---
-      if (state.ui) {
-        if (state.ui.source) { params.source = state.ui.source; setBarsState(); }
-        if (state.ui.browserCamId) { currentCamId = state.ui.browserCamId; }
+    if (state.ui) {
+      if (state.ui.source) { params.source = state.ui.source; setBarsState(); }
+      if (state.ui.browserCamId) { currentCamId = state.ui.browserCamId; }
 
-        if (params.source === SOURCE.PythonWS) startWSStream();
-        else startWebcamStream(currentCamId);
+      if (params.source === SOURCE.PythonWS) startWSStream();
+      else startWebcamStream(currentCamId);
 
-        if (wsConnected && state.ui.serverSelectedIndex != null) {
-          try { ws.send(JSON.stringify({ cmd: "set_cam", index: Number(state.ui.serverSelectedIndex) })); } catch {}
-        }
+      if (wsConnected && state.ui.serverSelectedIndex != null) {
+        try { ws.send(JSON.stringify({ cmd: "set_cam", index: Number(state.ui.serverSelectedIndex) })); } catch {}
       }
+    }
 
     // --- External model transforms (best-effort by id, fallback by name) ---
-      if (Array.isArray(state.models)) {
-        state.models.forEach(m => {
-          const rec = externalGroups.find(g => g.id === m.id) ||
-          externalGroups.find(g => g.name === m.name);
-          if (!rec) return;
-          rec.group.position.set(m.t.x, m.t.y, m.t.z);
-          rec.group.rotation.set(m.r.x, m.r.y, m.r.z);
-          rec.group.scale.setScalar(m.s);
-          rec.visible = !!m.visible;
-          rec.group.visible = rec.visible;
-          if (typeof m.density === "number") resampleGroupDensity(rec, m.density);
-        });
-        rebuildGroupsGUI();
-        updateExternalPointMaterials();
-      }
-
-      if (!silent && paused) renderer.render(scene, camera);
-    } catch (e) {
-      console.warn("[state] applyState failed", e);
+    if (Array.isArray(state.models)) {
+      state.models.forEach(m => {
+        const rec =
+        externalGroups.find(g => g.id === m.id) ||
+        externalGroups.find(g => g.name === m.name);
+        if (!rec) return;
+        rec.group.position.set(m.t.x, m.t.y, m.t.z);
+        rec.group.rotation.set(m.r.x, m.r.y, m.r.z);
+        rec.group.scale.setScalar(m.s);
+        rec.visible = !!m.visible;
+        rec.group.visible = rec.visible;
+        if (typeof m.density === "number") resampleGroupDensity(rec, m.density);
+      });
+      rebuildGroupsGUI();
+      updateExternalPointMaterials();
     }
+
+    if (!silent && paused) renderer.render(scene, camera);
+  } catch (e) {
+    console.warn("[state] applyState failed", e);
   }
+}
 
 
 
 
 
 
-  function getDB(){
-    if (_dbPromise) return _dbPromise;
-    _dbPromise = new Promise((resolve, reject)=>{
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE)){
-          db.createObjectStore(STORE, { keyPath: "name" });
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror   = () => reject(req.error);
-    });
-    return _dbPromise;
-  }
 
-  async function idbPutPreset(name, state){
-    const db = await getDB();
-    return new Promise((resolve,reject)=>{
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put({ name, state, ts: Date.now() });
-      tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
-    });
-  }
-  async function idbGetPreset(name){
-    const db = await getDB();
-    return new Promise((resolve,reject)=>{
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).get(name);
-      req.onsuccess = ()=> resolve(req.result?.state || null);
-      req.onerror   = ()=> reject(req.error);
-    });
-  }
-  async function idbDeletePreset(name){
-    const db = await getDB();
-    return new Promise((resolve,reject)=>{
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).delete(name);
-      tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
-    });
-  }
-  async function idbListPresets(){
-    const db = await getDB();
-    return new Promise((resolve,reject)=>{
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).getAll();
-      req.onsuccess = ()=> resolve((req.result || []).map(r => ({name:r.name, ts:r.ts})));
-      req.onerror   = ()=> reject(req.error);
-    });
-  }
+function getDB(){
+  if (_dbPromise) return _dbPromise;
+  _dbPromise = new Promise((resolve, reject)=>{
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)){
+        db.createObjectStore(STORE, { keyPath: "name" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+  return _dbPromise;
+}
+
+async function idbPutPreset(name, state){
+  const db = await getDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put({ name, state, ts: Date.now() });
+    tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function idbGetPreset(name){
+  const db = await getDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).get(name);
+    req.onsuccess = ()=> resolve(req.result?.state || null);
+    req.onerror   = ()=> reject(req.error);
+  });
+}
+async function idbDeletePreset(name){
+  const db = await getDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(name);
+    tx.oncomplete = resolve; tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function idbListPresets(){
+  const db = await getDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = ()=> resolve((req.result || []).map(r => ({name:r.name, ts:r.ts})));
+    req.onerror   = ()=> reject(req.error);
+  });
+}
 
 // Local autosave
-  const LS_LAST = "ld_last_state";
-  let _autosaveTimer = 0;
-  function scheduleAutosave(){
-    clearTimeout(_autosaveTimer);
-    _autosaveTimer = setTimeout(()=>{
-      try { localStorage.setItem(LS_LAST, JSON.stringify(currentState())); }
-      catch(e){ console.warn("[autosave] failed", e); }
-    }, 250);
-  }
-  function tryLoadAutosave(){
-    try{
-      const raw = localStorage.getItem(LS_LAST);
-      if (raw) applyState(JSON.parse(raw), {silent:true});
-    } catch(e){ console.warn("[autosave] load failed", e); }
-  }
+const LS_LAST = "ld_last_state";
+let _autosaveTimer = 0;
+function scheduleAutosave(){
+  clearTimeout(_autosaveTimer);
+  _autosaveTimer = setTimeout(()=>{
+    try { localStorage.setItem(LS_LAST, JSON.stringify(currentState())); }
+    catch(e){ console.warn("[autosave] failed", e); }
+  }, 250);
+}
+function tryLoadAutosave(){
+  try{
+    const raw = localStorage.getItem(LS_LAST);
+    if (raw) applyState(JSON.parse(raw), {silent:true});
+  } catch(e){ console.warn("[autosave] load failed", e); }
+}
 
 
 
 // Any GUI change or camera move => autosave
-  gui.onChange(() => { scheduleAutosave(); });
-  controls.addEventListener("change", scheduleAutosave);
-  window.addEventListener("beforeunload", scheduleAutosave);
+gui.onChange(() => { scheduleAutosave(); });
+controls.addEventListener("change", scheduleAutosave);
+window.addEventListener("beforeunload", scheduleAutosave);
 
 
 
@@ -733,15 +883,15 @@
   // Smooth alpha fade - WIP
 
 
-  function attachDepthFadeToPointsMaterial(mat){
+function attachDepthFadeToPointsMaterial(mat){
   // uniforms live on userData so we can tweak from GUI
-    const uniforms = mat.userData.depthFadeUniforms || {
-      uFadeStart: { value: params.fadeStart },
-      uFadeEnd:   { value: params.fadeEnd },
-      uEnabled:   { value: params.fadeEnabled ? 1 : 0 },
-      uDither:    { value: params.fadeDither ? 1 : 0 }
-    };
-    mat.userData.depthFadeUniforms = uniforms;
+  const uniforms = mat.userData.depthFadeUniforms || {
+    uFadeStart: { value: params.fadeStart },
+    uFadeEnd:   { value: params.fadeEnd },
+    uEnabled:   { value: params.fadeEnabled ? 1 : 0 },
+    uDither:    { value: params.fadeDither ? 1 : 0 }
+  };
+  mat.userData.depthFadeUniforms = uniforms;
 
   mat.transparent = true;            // needed for smooth alpha fade
   // keep your existing alphaTest logic for sprite shapes; it plays fine with dither
@@ -951,46 +1101,107 @@ function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
     //   return mat;
     // }
 
+// --- SINGLE ATTRACTOR SPHERE ---
+    const attractorSphere = new THREE.Mesh(
+      new THREE.SphereGeometry(0.05, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff55aa, wireframe: true })
+      );
+    
+    //attractorSphere.position.set(0, params.xrYOffset, -0.6);
+    attractorSphere.position.set(0, 1.7, -0.6);  
 
-    function makePointMaterialFromParams() {
-      const mat = new THREE.PointsMaterial({
-        size: params.pointSize,
-        vertexColors: true,
-        sizeAttenuation: true,
-        transparent: (params.pointShape !== "square"),
-        map: (shapeTexture || null),
-        alphaTest: (params.pointShape === "square" ? 0.0 : 0.5)
-      });
-      attachDepthFadeToPointsMaterial(mat);
-      return mat;
-    }
+    attractorSphere.visible = params.handSteamAttractEnabled;
+    scene.add(attractorSphere);
+
+// --- Hand pinch grabbing for the attractorSphere ---
+let grabbedByHand = null;                 // which hand currently holds the sphere (hand0/hand1), or null
+const GRAB_EXTRA_RADIUS = 0.01;           // extra leniency around the sphere
+const _wposTip = new THREE.Vector3();
+const _wposSphere = new THREE.Vector3();
+
+function fingertipOf(hand){
+  return hand?.joints?.['index-finger-tip'] || null;
+}
+function isTipNearSphere(hand){
+  if (!hand || !attractorSphere || !attractorSphere.visible) return false;
+  const tip = fingertipOf(hand); if (!tip) return false;
+  tip.getWorldPosition(_wposTip);
+  attractorSphere.getWorldPosition(_wposSphere);
+  const sphereR = (attractorSphere.geometry.boundingSphere?.radius || 0.05) * attractorSphere.scale.x;
+  return _wposTip.distanceTo(_wposSphere) <= (sphereR + GRAB_EXTRA_RADIUS);
+}
+function grabSphere(hand){
+  if (!hand || grabbedByHand) return;
+  const tip = fingertipOf(hand); if (!tip) return;
+  // Reparent while preserving world transform
+  tip.attach(attractorSphere);
+  grabbedByHand = hand;
+  // hide the gizmo while grabbed
+  try { tControls.detach(); } catch {}
+}
+function releaseSphere(){
+  if (!grabbedByHand) return;
+  // Put back under the scene while preserving world transform
+  scene.attach(attractorSphere);
+  grabbedByHand = null;
+}
 
 
 
-    function updateExternalPointMaterials() {
-      externalGroups.forEach(g => {
-        g.material.size = params.pointSize;
-        g.material.map = (shapeTexture || null);
-        g.material.alphaTest = (params.pointShape === "square" ? 0.0 : 0.5);
+
+
+// Make it grabbable with the existing gizmo:
+(() => {
+  // small helper in the Models folder would be fine, but here's a quick toggle:
+  const g = gui.addFolder("Attractor Control");
+  g.add({ select: ()=> tControls.attach(attractorSphere) }, "select").name("Select Attractor");
+  g.add({ detach: ()=> tControls.detach() }, "detach").name("Detach Gizmo");
+})();
+
+
+
+
+
+
+function makePointMaterialFromParams() {
+  const mat = new THREE.PointsMaterial({
+    size: params.pointSize,
+    vertexColors: true,
+    sizeAttenuation: true,
+    transparent: (params.pointShape !== "square"),
+    map: (shapeTexture || null),
+    alphaTest: (params.pointShape === "square" ? 0.0 : 0.5)
+  });
+  attachDepthFadeToPointsMaterial(mat);
+  return mat;
+}
+
+
+
+function updateExternalPointMaterials() {
+  externalGroups.forEach(g => {
+    g.material.size = params.pointSize;
+    g.material.map = (shapeTexture || null);
+    g.material.alphaTest = (params.pointShape === "square" ? 0.0 : 0.5);
         g.material.transparent = true;  // <—
         g.material.depthWrite  = false; // <—
         g.material.needsUpdate = true;
       });
-    }
+}
 
     // --- END NEW BLOCK ---
 
 
-    function setPointShape(){
-      if (shapeTexture){ shapeTexture.dispose(); shapeTexture=null; }
+function setPointShape(){
+  if (shapeTexture){ shapeTexture.dispose(); shapeTexture=null; }
 
-      if (params.pointShape==="square"){
-        cloudMaterial.map = null;
-        cloudMaterial.alphaTest = 0.0;
-      } else if (params.pointShape==="circle"){
-        shapeTexture = makeCircleTexture(64, params.shapeFeather);
-        cloudMaterial.map = shapeTexture;
-        cloudMaterial.alphaTest = 0.5;
+  if (params.pointShape==="square"){
+    cloudMaterial.map = null;
+    cloudMaterial.alphaTest = 0.0;
+  } else if (params.pointShape==="circle"){
+    shapeTexture = makeCircleTexture(64, params.shapeFeather);
+    cloudMaterial.map = shapeTexture;
+    cloudMaterial.alphaTest = 0.5;
       } else { // cross
         shapeTexture = makeCrossTexture(64, params.crossThickness, params.shapeFeather);
         cloudMaterial.map = shapeTexture;
@@ -1278,63 +1489,211 @@ function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
     }
 
 
-    // function impulseOnHit(i){
-    //   rainFlash[i]=HIT_FLASH_MS;
-    //   const x=rainPos[3*i], y=rainPos[3*i+1], z=rainPos[3*i+2], c=cloudBounds.center, s=params.rainSpeed;
-    //   if (behaviour===BEHAVIOUR.STICK){ rainStick[i]=STICK_MS; rainVX[i]=rainVY[i]=rainVZ[i]=0; }
-    //   else if (behaviour===BEHAVIOUR.FLY_UP){ rainVY[i]=(3.2+Math.random()*0.8)*s; rainVX[i]=(Math.random()*2-1)*0.3*s; rainVZ[i]=(Math.random()*2-1)*0.3*s; rainBounce[i]=450; }
-    //   else if (behaviour===BEHAVIOUR.RADIAL){ let dx=x-c.x,dy=y-c.y,dz=z-c.z; const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const sp=(2.4+Math.random()*0.8)*s; rainVX[i]=dx*sp; rainVY[i]=dy*sp; rainVZ[i]=dz*sp; rainBounce[i]=600; }
-    //   else { let dx=Math.random()*2-1,dy=Math.random()*2-1,dz=Math.random()*2-1; const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const sp=(2.2+Math.random()*1.2)*s; rainVX[i]=dx*sp; rainVY[i]=dy*sp; rainVZ[i]=dz*sp; rainBounce[i]=500; }
-    // }
+// --- HAND STEAM PARTICLES ---
+  let handSteamGeom = null, handSteamPoints = null;  // handSteamMat was declared earlier
+  let hsPos=null, hsCol=null, hsVel=null, hsLife=null;
+  let handSteamNext=0; // circular writer index
 
-    // function stepRain(dt){
-    //   const R=(cloudBounds.radius||0.8)+0.5, floorY=cloudBounds.center.y-R, grav=GRAVITY_BASE*params.rainSpeed;
-    //   for (let i=0;i<RAIN_COUNT;i++){
-    //     const base=3*i;
-    //     if (rainStick[i]>0){ rainStick[i]-=dt*1000; rainFlash[i]=Math.max(rainFlash[i],40); }
-    //     else {
-    //       let g=grav; if (rainBounce[i]>0){ g*=0.25; rainBounce[i]-=dt*1000; }
-    //       rainVY[i]-=g*dt; rainPos[base]+=rainVX[i]*dt; rainPos[base+1]+=rainVY[i]*dt; rainPos[base+2]+=rainVZ[i]*dt;
-    //       if (collidesWithCloud(rainPos[base],rainPos[base+1],rainPos[base+2])) impulseOnHit(i);
-    //     }
-    //     if (rainFlash[i]>0){
-    //       rainFlash[i]-=dt*1000; const t=Math.max(0,Math.min(1,rainFlash[i]/HIT_FLASH_MS));
-    //       rainCol[base]=1.0*t+0.5*(1-t); rainCol[base+1]=0.1*t+0.7*(1-t); rainCol[base+2]=0.1*t+1.0*(1-t);
-    //     } else if (rainStick[i]<=0){ rainCol[base]=0.5; rainCol[base+1]=0.7; rainCol[base+2]=1.0; }
-    //     const c=cloudBounds.center;
-    //     const far=Math.hypot(rainPos[base]-c.x,rainPos[base+1]-c.y,rainPos[base+2]-c.z)>(cloudBounds.radius+2.5);
-    //     if ((rainStick[i]<=0 && rainPos[base+1]<floorY) || far) respawnDrop(i);
-    //   }
-    //   rainGeom.getAttribute('position').needsUpdate=true; rainGeom.getAttribute('color').needsUpdate=true;
-    // }
+
+
+  function rebuildHandSteam(count){
+  // Clamp + normalize
+    count = Math.max(0, Math.min(20000, count | 0));
+
+  // Tear down old
+    if (handSteamPoints){
+      scene.remove(handSteamPoints);
+      handSteamGeom?.dispose();
+      handSteamMat?.dispose();
+    }
+
+  // Buffers
+    handSteamGeom = new THREE.BufferGeometry();
+    hsPos  = new Float32Array(count * 3);
+    hsCol  = new Float32Array(count * 3);
+    hsVel  = new Float32Array(count * 3);
+    hsLife = new Float32Array(count);
+
+    const [cr, cg, cb] = params.handSteamColor;
+    for (let i = 0; i < count; i++){
+      const b = 3 * i;
+    // park offscreen until spawned
+      hsPos[b] = hsPos[b+1] = hsPos[b+2] = 9999;
+      hsVel[b] = hsVel[b+1] = hsVel[b+2] = 0;
+      hsLife[i] = 0;
+      hsCol[b] = cr; hsCol[b+1] = cg; hsCol[b+2] = cb;
+    }
+
+  // Attributes (dynamic, we update every frame)
+    const aPos = new THREE.BufferAttribute(hsPos, 3);
+    const aCol = new THREE.BufferAttribute(hsCol, 3);
+    aPos.setUsage?.(THREE.DynamicDrawUsage);
+    aCol.setUsage?.(THREE.DynamicDrawUsage);
+    handSteamGeom.setAttribute('position', aPos);
+    handSteamGeom.setAttribute('color',    aCol);
+
+  // Material (unit-safe; actual size applied below)
+    const ar = isARSession();
+    handSteamMat = new THREE.PointsMaterial({
+      size: ar ? params.handSteamSizePx : params.handSteamSizeWorld,
+      vertexColors: true,
+    sizeAttenuation: !ar,     // AR: pixel size; VR/Desktop: world-attenuated
+    transparent: true,
+    depthWrite: false
+  });
+    attachDepthFadeToPointsMaterial(handSteamMat);
+
+  // Points
+    handSteamPoints = new THREE.Points(handSteamGeom, handSteamMat);
+    handSteamPoints.frustumCulled = false;
+    handSteamPoints.visible = !!params.handSteamEnabled;
+    scene.add(handSteamPoints);
+
+  // Reset circular writer and ensure sizing mirrors are in sync
+    handSteamNext = 0;
+    syncComputedHandSizes();
+  applyHandSteamSize();        // picks px vs m based on current session
+}
+
+// Build once from current preset
+rebuildHandSteam(params.handSteamCount | 0);
+
+
+
+// helper: gather current joint world positions
+const _jtmp = new THREE.Vector3();
+function gatherHandJointPositions(){
+  const out = [];
+  [hand0, hand1].forEach(h=>{
+    const js = h?.joints ? Object.values(h.joints) : null;
+    if (!js) return;
+    for (let j=0;j<js.length;j++){
+      js[j].getWorldPosition(_jtmp);
+      out.push(_jtmp.x, _jtmp.y, _jtmp.z);
+    }
+  });
+  return out; // flat [x,y,z,...]
+}
+
+// spawn N particles around random joints
+function spawnHandSteam(n){
+  if (!hsPos || !n) return;
+  const joints = gatherHandJointPositions();
+  const J = Math.floor(joints.length/3);
+  if (!J) return;
+
+  const spread = params.handSteamSpread;
+  for (let k=0;k<n;k++){
+    const j = (Math.random()*J)|0;
+    const j3 = j*3;
+    const jx=joints[j3], jy=joints[j3+1], jz=joints[j3+2];
+
+    // random offset around joint
+    let ox,oy,oz,L;
+    do { ox=Math.random()*2-1; oy=Math.random()*2-1; oz=Math.random()*2-1; L=ox*ox+oy*oy+oz*oz; } while (L>1 || L===0);
+    ox*=spread; oy*=spread; oz*=spread;
+
+    const i = handSteamNext;
+    handSteamNext = (handSteamNext + 1) % hsLife.length;
+
+    const b = 3*i;
+    hsPos[b]   = jx + ox;
+    hsPos[b+1] = jy + oy;
+    hsPos[b+2] = jz + oz;
+
+    const up = params.handSteamUpVel;
+    hsVel[b]   = (Math.random()*2-1) * up*0.15;
+    hsVel[b+1] = up * (0.6 + Math.random()*0.6);
+    hsVel[b+2] = (Math.random()*2-1) * up*0.15;
+
+    hsLife[i] = 0.9 + Math.random()*1.0; // seconds
+  }
+}
+
+// step simulation
+function stepHandSteam(dt){
+  if (!handSteamPoints || !params.handSteamEnabled) return;
+
+  // births
+  spawnHandSteam(Math.min(params.handSteamBirthsPerFrame|0, hsLife.length));
+
+  const attractON = params.handSteamAttractEnabled && attractorSphere?.visible;
+  const ax = attractorSphere.position.x, ay = attractorSphere.position.y, az = attractorSphere.position.z;
+  const maxD = Math.max(1e-6, params.handSteamAttractMax);
+  const invMax = 1.0 / maxD;
+  const strength = params.handSteamAttractStrength;
+
+  const drag = Math.max(0, params.handSteamDrag);
+  const damp = Math.exp(-drag * dt); // stable damping
+
+  for (let i=0;i<hsLife.length;i++){
+    if (hsLife[i] <= 0) continue;
+    hsLife[i] -= dt;
+    const b=3*i;
+
+    // attraction (only when close)
+    if (attractON){
+      const dx = ax - hsPos[b];
+      const dy = ay - hsPos[b+1];
+      const dz = az - hsPos[b+2];
+      const d  = Math.hypot(dx,dy,dz);
+      if (d < maxD && d > 1e-4){
+        const t = 1.0 - d*invMax; // 0..1 (closer => stronger)
+        const acc = strength * t; // m/s^2
+        const sx = dx/d, sy = dy/d, sz = dz/d;
+        hsVel[b]   += sx * acc * dt;
+        hsVel[b+1] += sy * acc * dt;
+        hsVel[b+2] += sz * acc * dt;
+      }
+    }
+
+    // damping
+    hsVel[b]   *= damp;
+    hsVel[b+1] *= damp;
+    hsVel[b+2] *= damp;
+
+    // integrate
+    hsPos[b]   += hsVel[b]   * dt;
+    hsPos[b+1] += hsVel[b+1] * dt;
+    hsPos[b+2] += hsVel[b+2] * dt;
+
+    // kill if too far or under floor-like bounds (cheap)
+    if (Math.abs(hsPos[b]) + Math.abs(hsPos[b+1]) + Math.abs(hsPos[b+2]) > 100) hsLife[i] = 0;
+  }
+
+  handSteamGeom.getAttribute('position').needsUpdate = true;
+}
+
+
+
 
     // ---------- Transitions / Export / Keys ----------
-    function startBuild(){ if (!curPos||!nextPos) return;
-    if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
-    const R=(cloudBounds.radius||0.8)*2.5, c=cloudBounds.center;
-    for (let i=0;i<lastPos.length;i+=3){
-      let rx=Math.random()*2-1, ry=Math.random()*2-1, rz=Math.random()*2-1; const L=Math.hypot(rx,ry,rz)||1; rx/=L; ry/=L; rz/=L;
-      const d=(0.3+Math.random()*0.7)*R; lastPos[i]=c.x+rx*d; lastPos[i+1]=c.y+ry*d; lastPos[i+2]=c.z+rz*d;
-      curPos[i]=lastPos[i]; curPos[i+1]=lastPos[i+1]; curPos[i+2]=lastPos[i+2];
-    }
-    cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
-    targetTweenMs=BUILD_MS; tweenT=0; transitionMode=TRANSITION.BUILD;
-    cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
-    statusText=`Build: tweening in ${BUILD_MS}ms`;
-  }
+function startBuild(){ if (!curPos||!nextPos) return;
+if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
+const R=(cloudBounds.radius||0.8)*2.5, c=cloudBounds.center;
+for (let i=0;i<lastPos.length;i+=3){
+  let rx=Math.random()*2-1, ry=Math.random()*2-1, rz=Math.random()*2-1; const L=Math.hypot(rx,ry,rz)||1; rx/=L; ry/=L; rz/=L;
+  const d=(0.3+Math.random()*0.7)*R; lastPos[i]=c.x+rx*d; lastPos[i+1]=c.y+ry*d; lastPos[i+2]=c.z+rz*d;
+  curPos[i]=lastPos[i]; curPos[i+1]=lastPos[i+1]; curPos[i+2]=lastPos[i+2];
+}
+cloudGeom.getAttribute('position').needsUpdate=true; cloudGeom.computeBoundingSphere();
+targetTweenMs=BUILD_MS; tweenT=0; transitionMode=TRANSITION.BUILD;
+cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
+statusText=`Build: tweening in ${BUILD_MS}ms`;
+}
 
-  function startDissolve(){ if (!curPos) return;
-  if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
-  const c=cloudBounds.center, speedBase=DISSOLVE_SPEED*Math.max(1,cloudBounds.radius||1);
-  for (let i=0;i<curPos.length;i+=3){
-    let dx=curPos[i]-c.x, dy=curPos[i+1]-c.y, dz=curPos[i+2]-c.z;
-    if (!(isFinite(dx)&&isFinite(dy)&&isFinite(dz)) || (Math.abs(dx)+Math.abs(dy)+Math.abs(dz)<1e-6)){ dx=Math.random()*2-1; dy=Math.random()*2-1; dz=Math.random()*2-1; }
-    const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const s=speedBase*(0.6+Math.random()*1.4);
-    dissolveVel[i]=dx*s; dissolveVel[i+1]=dy*s; dissolveVel[i+2]=dz*s;
-  }
-  dissolveElapsed=0; transitionMode=TRANSITION.DISSOLVE;
-  cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
-  statusText=`Dissolve: flying out for ${DISSOLVE_MS}ms`;
+function startDissolve(){ if (!curPos) return;
+if (!dissolveVel||dissolveVel.length!==curPos.length) dissolveVel=new Float32Array(curPos.length);
+const c=cloudBounds.center, speedBase=DISSOLVE_SPEED*Math.max(1,cloudBounds.radius||1);
+for (let i=0;i<curPos.length;i+=3){
+  let dx=curPos[i]-c.x, dy=curPos[i+1]-c.y, dz=curPos[i+2]-c.z;
+  if (!(isFinite(dx)&&isFinite(dy)&&isFinite(dz)) || (Math.abs(dx)+Math.abs(dy)+Math.abs(dz)<1e-6)){ dx=Math.random()*2-1; dy=Math.random()*2-1; dz=Math.random()*2-1; }
+  const L=Math.hypot(dx,dy,dz)||1; dx/=L; dy/=L; dz/=L; const s=speedBase*(0.6+Math.random()*1.4);
+  dissolveVel[i]=dx*s; dissolveVel[i+1]=dy*s; dissolveVel[i+2]=dz*s;
+}
+dissolveElapsed=0; transitionMode=TRANSITION.DISSOLVE;
+cloudMaterial.transparent=true; cloudMaterial.opacity=1; cloudMaterial.needsUpdate=true;
+statusText=`Dissolve: flying out for ${DISSOLVE_MS}ms`;
 }
 
 function resetTransition(){
@@ -1650,7 +2009,17 @@ function frame(nowMs){
 
     // rain + render
     stepRain(dt);
+    stepHandSteam(dt);
+
     if (!renderer.xr.isPresenting) controls.update();
+
+
+    // update hand point clouds (AR/VR)
+    ensureHandPointsExist();
+    updateHandPoints(hand0, hand0Points);
+    updateHandPoints(hand1, hand1Points);
+
+
     renderer.render(scene, camera);
   }
 
@@ -1664,8 +2033,6 @@ function frame(nowMs){
     overlay.textContent = `${statusText} | ${fps} fps | [1..4] modes · [P]ause · [S]ave · [F]ullscreen · [G]/[Shift+G] export`;
   }
 }
-
-
 
 
 // function frame(nowMs){
@@ -1999,15 +2366,174 @@ async function bootstrap(){
 
 
 // create hands
+// const handFactory = new XRHandModelFactory();
+
+// const hand0 = renderer.xr.getHand(0);
+// hand0.add(handFactory.createHandModel(hand0, 'mesh')); // 'mesh' | 'spheres' | 'boxes'
+// scene.add(hand0);
+
+// const hand1 = renderer.xr.getHand(1);
+// hand1.add(handFactory.createHandModel(hand1, 'mesh'));
+// scene.add(hand1);
+
+
+
+// --- HANDS AS POINT CLOUDS ---
 const handFactory = new XRHandModelFactory();
-
 const hand0 = renderer.xr.getHand(0);
-hand0.add(handFactory.createHandModel(hand0, 'mesh')); // 'mesh' | 'spheres' | 'boxes'
-scene.add(hand0);
-
 const hand1 = renderer.xr.getHand(1);
-hand1.add(handFactory.createHandModel(hand1, 'mesh'));
-scene.add(hand1);
+scene.add(hand0, hand1);
+
+// build joint objects (spheres) so we get per-joint Object3Ds that track poses,
+// then hide them; we'll render our own Points
+const hand0Model = handFactory.createHandModel(hand0, 'spheres');
+const hand1Model = handFactory.createHandModel(hand1, 'spheres');
+
+hand0.add(hand0Model);
+hand1.add(hand1Model);
+
+hand0Model.visible = false;
+hand1Model.visible = false;
+
+
+// Pinch → grab / release like the three.js example
+hand0.addEventListener('pinchstart', () => { if (!grabbedByHand && isTipNearSphere(hand0)) grabSphere(hand0); });
+hand1.addEventListener('pinchstart', () => { if (!grabbedByHand && isTipNearSphere(hand1)) grabSphere(hand1); });
+
+hand0.addEventListener('pinchend',   () => { if (grabbedByHand === hand0) releaseSphere(); });
+hand1.addEventListener('pinchend',   () => { if (grabbedByHand === hand1) releaseSphere(); });
+
+
+
+// precompute unit offsets for max cluster size so we don't re-random each frame
+const MAX_HAND_CLUSTER = 80;
+const HAND_OFFSETS = (() => {
+  const out = new Float32Array(MAX_HAND_CLUSTER * 3);
+  for (let i=0;i<MAX_HAND_CLUSTER;i++){
+    // random point on/inside unit sphere
+    let x,y,z, L;
+    do { x=Math.random()*2-1; y=Math.random()*2-1; z=Math.random()*2-1; L=x*x+y*y+z*z; } while (L>1 || L===0);
+    out[i*3]=x; out[i*3+1]=y; out[i*3+2]=z;
+  }
+  return out;
+})();
+
+function makeHandPoints(hand) {
+  const joints = hand.joints ? Object.values(hand.joints) : [];
+  const nj = joints.length;
+  if (!nj) return null;
+
+  const k = Math.min(MAX_HAND_CLUSTER, Math.max(1, params.handClusterCount|0));
+  const n = nj * k;
+
+  const geom = new THREE.BufferGeometry();
+  const pos  = new Float32Array(n * 3);
+  const col  = new Float32Array(n * 3);
+
+  // gentle blue; brightness applied later
+  for (let i=0;i<n;i++){ col[i*3]=0.6; col[i*3+1]=0.8; col[i*3+2]=1.0; }
+
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+
+  const mat = makePointMaterialFromParams();
+
+  // === CHANGED: pick sizing by session type (AR vs VR/Desktop) ===
+  const isAR = (renderer.xr.getSession()?.environmentBlendMode !== 'opaque');
+  mat.sizeAttenuation = !isAR; // AR: pixels (no attenuation), VR/Desktop: meters (attenuation)
+  mat.size = isAR ? params.handPointSizePx : params.handPointSizeWorld;
+  // ===============================================================
+
+  mat.needsUpdate = true;
+
+  const pts = new THREE.Points(geom, mat);
+  pts.userData._clusterK = k;
+  scene.add(pts);
+  return pts;
+}
+
+
+
+
+
+
+// create Points after the joint nodes exist (right away is fine since we just added models)
+hand0Points = makeHandPoints(hand0);
+hand1Points = makeHandPoints(hand1);
+
+
+
+// helper to update a hand Points from its joint world positions
+const _tmp = new THREE.Vector3();
+
+
+function updateHandPoints(hand, pts) {
+  if (!pts || !hand.joints) return;
+  const joints = Object.values(hand.joints);
+  const nj = joints.length; if (!nj) return;
+
+  // ensure geometry matches current density
+  const k = Math.min(MAX_HAND_CLUSTER, Math.max(1, params.handClusterCount|0));
+  const needed = nj * k * 3;
+  let attrPos = pts.geometry.getAttribute('position');
+  let attrCol = pts.geometry.getAttribute('color');
+  if (!attrPos || attrPos.array.length !== needed) {
+    const pos = new Float32Array(needed);
+    const col = new Float32Array(needed);
+    for (let i = 0; i < needed/3; i++) { col[i*3]=0.6; col[i*3+1]=0.8; col[i*3+2]=1.0; }
+      pts.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    pts.geometry.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+    attrPos = pts.geometry.getAttribute('position');
+    attrCol = pts.geometry.getAttribute('color');
+    pts.userData._clusterK = k;
+  }
+
+  const pos = attrPos.array;
+  const col = attrCol.array;
+  const r   = params.handClusterRadius;
+  const bright = params.handBrightness;
+
+  let m = 0;
+  for (let j = 0; j < nj; j++) {
+    const joint = joints[j];
+    joint.getWorldPosition(_tmp);
+    const baseX = _tmp.x, baseY = _tmp.y, baseZ = _tmp.z;
+
+    for (let i = 0; i < k; i++) {
+      const ox = HAND_OFFSETS[i*3]   * r;
+      const oy = HAND_OFFSETS[i*3+1] * r;
+      const oz = HAND_OFFSETS[i*3+2] * r;
+      pos[m]   = baseX + ox;
+      pos[m+1] = baseY + oy;
+      pos[m+2] = baseZ + oz;
+
+      // brightness applied here (clamped)
+      const ci = (m/3)|0;
+      col[ci*3]   = Math.min(1, 0.6 * bright);
+      col[ci*3+1] = Math.min(1, 0.8 * bright);
+      col[ci*3+2] = Math.min(1, 1.0 * bright);
+
+      m += 3;
+    }
+  }
+
+  attrPos.needsUpdate = true;
+  attrCol.needsUpdate = true;
+  pts.geometry.computeBoundingSphere();
+
+  // === CHANGED: keep size in sync with GUI and AR/VR ===
+  if (pts.material) {
+    const isAR = (renderer.xr.getSession()?.environmentBlendMode !== 'opaque');
+    pts.material.sizeAttenuation = !isAR; // AR: pixel size (no attenuation); VR/Desktop: world size (attenuation)
+    pts.material.size = isAR ? params.handPointSizePx : params.handPointSizeWorld;
+    pts.material.needsUpdate = true;
+  }
+  // =====================================================
+}
+
+
+
+
 
 
 // AR
@@ -2023,7 +2549,31 @@ document.body.appendChild( XRButton.createButton(renderer, {
 
 
 
-    // Controllers: trigger cycles transitions
+function rebuildHandPoints() {
+  // remove old
+  if (hand0Points){ scene.remove(hand0Points); hand0Points.geometry.dispose(); hand0Points.material.dispose(); hand0Points=null; }
+  if (hand1Points){ scene.remove(hand1Points); hand1Points.geometry.dispose(); hand1Points.material.dispose(); hand1Points=null; }
+  // recreate if joints exist
+  if (hand0.joints && Object.keys(hand0.joints).length) hand0Points = makeHandPoints(hand0);
+  if (hand1.joints && Object.keys(hand1.joints).length) hand1Points = makeHandPoints(hand1);
+}
+
+
+function ensureHandPointsExist() {
+  if (!hand0Points && hand0.joints && Object.keys(hand0.joints).length) {
+    hand0Points = makeHandPoints(hand0);
+  }
+  if (!hand1Points && hand1.joints && Object.keys(hand1.joints).length) {
+    hand1Points = makeHandPoints(hand1);
+  }
+}
+
+
+
+
+
+  // Controllers: trigger cycles transitions
+
 const controllerModelFactory = new XRControllerModelFactory();
 const ctrl0 = renderer.xr.getController(0);
 const ctrl1 = renderer.xr.getController(1);
@@ -2036,94 +2586,169 @@ grip1.add(controllerModelFactory.createControllerModel(grip1));
 
 scene.add(grip0, grip1);
 
-    let triggerState = 0; // 0→Build, 1→Dissolve, 2→Reset, then repeat
-    const cycleTransitions = ()=>{
-      if (triggerState===0){ startBuild(); }
-      else if (triggerState===1){ startDissolve(); }
-      else { resetTransition(); }
-      triggerState = (triggerState+1)%3;
-    };
-    ctrl0.addEventListener('selectstart', cycleTransitions);
-    ctrl1.addEventListener('selectstart', cycleTransitions);
-
-    // XR session start/end: placement & material tweaks
-    renderer.xr.addEventListener('sessionstart', ()=>{
 
 
-      controls.enabled = false;
+  let triggerState = 0; // 0→Build, 1→Dissolve, 2→Reset, then repeat
 
-      const s = renderer.xr.getSession();
-      const blend = s?.environmentBlendMode || 'opaque';
-      const isAR = (blend !== 'opaque');
+  const cycleTransitions = ()=>{
+    if (triggerState===0){ startBuild(); }
+    else if (triggerState===1){ startDissolve(); }
+    else { resetTransition(); }
+    triggerState = (triggerState+1)%3;
+  };
 
-      if (isAR){
-        // Transparent background over passthrough
-        scene.background = null;
-        renderer.setClearAlpha(0);
+  ctrl0.addEventListener('selectstart', cycleTransitions);
+  ctrl1.addEventListener('selectstart', cycleTransitions);
 
-        // Place the cloud in front, slightly down, and scale smaller
-        cloudGroup.position.set(0, params.xrYOffset, -params.xrDistance);
-        cloudGroup.scale.setScalar(params.xrScale);
 
-        // Points: screen-space sizing for crispness over camera feed
-        cloudMaterial.sizeAttenuation = false;
-        cloudMaterial.size = Math.max(params.pointSize, params.xrPointPixelSize);
-        cloudMaterial.blending = THREE.NormalBlending;
-        cloudMaterial.needsUpdate = true;
 
-        // Hide VR floor/grid in AR
-        floorGrid.visible = false;
-      } else {
-        // VR room: solid background, world-space size
-        scene.background = new THREE.Color(0x000000);
-        renderer.setClearAlpha(1);
 
-        cloudGroup.position.set(0, 0, -1.2);
-        cloudGroup.scale.setScalar(1);
+// XR session start/end: placement & material tweaks
+  renderer.xr.addEventListener('sessionstart', () => {
+  renderer.xr.setFoveation(0.0);              // 0..1  (0 = off, 1 = max)
+  renderer.xr.setFramebufferScaleFactor(1.0); // 0.5..1 (lower = faster)
 
-        cloudMaterial.sizeAttenuation = true;
-        cloudMaterial.size = params.pointSize;
-        cloudMaterial.blending = THREE.AdditiveBlending;
-        cloudMaterial.needsUpdate = true;
+  controls.enabled = false;
 
-        floorGrid.visible = true;
-      }
+  // Ensure hands exist and sizes mirror current session (AR vs VR)
+  ensureHandPointsExist();
+  syncComputedHandSizes();
 
-      updateExternalPointMaterials(); 
+  const s = renderer.xr.getSession();
+  const blend = s?.environmentBlendMode || 'opaque';
+  const isAR = (blend !== 'opaque');
+
+  if (isAR) {
+    // Transparent background over passthrough
+    scene.background = null;
+    renderer.setClearAlpha(0);
+
+    // Place the cloud in front, slightly down, and scale smaller
+    cloudGroup.position.set(0, params.xrYOffset, -params.xrDistance);
+    cloudGroup.scale.setScalar(params.xrScale);
+
+    // Points: screen-space sizing for crispness over camera feed
+    cloudMaterial.sizeAttenuation = false;
+    cloudMaterial.size = Math.max(params.pointSize, params.xrPointPixelSize);
+    cloudMaterial.blending = THREE.NormalBlending;
+    cloudMaterial.needsUpdate = true;
+
+    // Hide VR floor/grid in AR
+    floorGrid.visible = false;
+  } else {
+    // VR room: solid background, world-space size
+    scene.background = new THREE.Color(0x000000);
+    renderer.setClearAlpha(1);
+
+    cloudGroup.position.set(0, 0, -1.2);
+    cloudGroup.scale.setScalar(1);
+
+    cloudMaterial.sizeAttenuation = true;
+    cloudMaterial.size = params.pointSize;
+    cloudMaterial.blending = THREE.AdditiveBlending;
+    cloudMaterial.needsUpdate = true;
+
+    floorGrid.visible = true;
+  }
+
+  // Keep external point-cloud materials synced (GLB point sets)
+  externalGroups.forEach(g => {
+    g.material.sizeAttenuation = !isAR; // AR: pixel size; VR: world-size attenuation
+    g.material.size = isAR ? Math.max(params.pointSize, params.xrPointPixelSize) : params.pointSize;
+    g.material.needsUpdate = true;
+  });
+
+  // XR-hand point clouds: screen-space in AR, world-space in VR
+  if (hand0Points?.material) applyHandPointSizeTo(hand0Points.material);
+  if (hand1Points?.material) applyHandPointSizeTo(hand1Points.material);
+
+  // Hand steam particles:
+  //  - make sure they exist
+  //  - apply correct pixel/world sizing
+  //  - enforce visibility from the preset
+  if (!handSteamPoints || !handSteamGeom || !handSteamMat) {
+    rebuildHandSteam(params.handSteamCount | 0);
+  }
+  applyHandSteamSize();
+  if (handSteamPoints) handSteamPoints.visible = !!params.handSteamEnabled;
+
+  // Attractor sphere visibility follows toggle
+  if (typeof attractorSphere !== 'undefined' && attractorSphere) {
+    attractorSphere.visible = !!params.handSteamAttractEnabled;
+  }
+
+  // Also keep external materials’ fade uniforms up-to-date (already handled elsewhere, but safe)
+  updateExternalPointMaterials();
+});
+
+  renderer.xr.addEventListener('sessionend', () => {
+    controls.enabled = true;
+
+    renderer.xr.setFoveation(0.0);
+    renderer.xr.setFramebufferScaleFactor(1.0);
+
+  // Back to desktop background
+    scene.background = new THREE.Color(0x000000);
+    renderer.setClearAlpha(1);
+
+  // Restore desktop placement
+    cloudGroup.position.set(0, 0, 0);
+    cloudGroup.scale.setScalar(1);
+
+    cloudMaterial.sizeAttenuation = true;
+    cloudMaterial.size = params.pointSize;
+    cloudMaterial.blending = THREE.NormalBlending;
+    cloudMaterial.needsUpdate = true;
+
+    floorGrid.visible = true;
+
+  // External point clouds → desktop/world sizing again
+    externalGroups.forEach(g => {
+      g.material.sizeAttenuation = true;
+      g.material.size = params.pointSize;
+      g.material.needsUpdate = true;
     });
 
-    renderer.xr.addEventListener('sessionend', ()=>{
-      controls.enabled = true;
-      scene.background = new THREE.Color(0x000000);
-      renderer.setClearAlpha(1);
+  // Re-sync sizing mirrors for non-XR mode and apply to materials
+    syncComputedHandSizes();
 
-      // Restore desktop placement
-      cloudGroup.position.set(0,0,0);
-      cloudGroup.scale.setScalar(1);
+  // Restore desktop sizing for hand points
+    if (hand0Points?.material) applyHandPointSizeTo(hand0Points.material);
+    if (hand1Points?.material) applyHandPointSizeTo(hand1Points.material);
 
-      cloudMaterial.sizeAttenuation = true;
-      cloudMaterial.size = params.pointSize;
-      cloudMaterial.blending = THREE.NormalBlending;
-      cloudMaterial.needsUpdate = true;
+  // Restore desktop sizing for hand steam (and keep visibility)
+    if (!handSteamPoints || !handSteamGeom || !handSteamMat) {
+      rebuildHandSteam(params.handSteamCount | 0);
+    }
+    applyHandSteamSize();
+    if (handSteamPoints) handSteamPoints.visible = !!params.handSteamEnabled;
 
-      floorGrid.visible = true;
+  // Attractor visibility follows the toggle even outside XR
+    if (typeof attractorSphere !== 'undefined' && attractorSphere) {
+      attractorSphere.visible = !!params.handSteamAttractEnabled;
+    }
 
-      updateExternalPointMaterials(); 
+    releaseSphere();
 
-    });
+    updateExternalPointMaterials();
+  });
+
+
+
+
 
     // ---------- Boot ----------
-    bootstrap();
+  bootstrap();
 
 
 // --- NEW BLOCK: Drag & Drop + File input loader ---
-    const gltfLoader = new GLTFLoader();
+  const gltfLoader = new GLTFLoader();
 
     // DRACO support (GLB/GLTF with KHR_draco_mesh_compression)
-    const dracoLoader = new DRACOLoader();
+  const dracoLoader = new DRACOLoader();
 
     // Use Google's hosted decoder (fast + cached). Path must end with '/'
-    dracoLoader.setDecoderPath("https://www.gstatic.com/draco/v1/decoders/");
+  dracoLoader.setDecoderPath("https://www.gstatic.com/draco/v1/decoders/");
     dracoLoader.setWorkerLimit(2);          // optional, keeps CPU sane
     // (Optional) prefer WASM explicitly:
     // dracoLoader.setDecoderConfig({ type: "wasm" });

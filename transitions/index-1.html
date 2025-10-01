@@ -1,0 +1,526 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Point Cloud ↔ Point Cloud Transitions (THREE.js)</title>
+  <link rel="icon" href="data:,">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    #overlay { position:fixed; top:12px; left:12px; color:#0f0; font:12px/1.4 monospace; background:rgba(0,0,0,.35); padding:8px 10px; border-radius:8px; pointer-events:none; }
+    .hud { position:fixed; bottom:12px; left:12px; color:#9f9; font:12px/1.4 monospace; background:rgba(0,0,0,.35); padding:8px 10px; border-radius:8px; }
+    a { color:#9f9; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/",
+        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.18/dist/lil-gui.esm.min.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">booting…</div>
+  <div class="hud">
+    Keys: [1..5] mode · [Space] trigger · [C] cube/sphere target · [R] reshuffle · [P] pause · [F] fullscreen
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { GUI } from "lil-gui";
+
+    // ---------- Scene ----------
+    const overlay = document.getElementById("overlay");
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 3.2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // Subtle lights for additive bloom-like feel on particles
+    const light = new THREE.DirectionalLight(0xffffff, 0.6);
+    light.position.set(1,1,1);
+    scene.add(light, new THREE.AmbientLight(0xffffff, 0.2));
+
+    // ---------- Parameters / GUI ----------
+    const MODES = {
+      "1 · Morph (ease)": "morph",
+      "2 · Swirl Morph": "swirl",
+      "3 · Bezier Flow": "bezier",
+      "4 · Dissolve/Rebuild": "dissolve",
+      "5 · Staggered Build": "stagger"
+    };
+
+    const params = {
+      pointCount: 30000,
+      pointSize: 0.01,
+      mode: MODES["1 · Morph (ease)"],
+      durationMs: 1400,
+      swirlTurns: 1.0,
+      bezierArc: 0.55,
+      dissolveMs: 1200,
+      colorLerp: true,
+      target: "sphere", // or "cube"
+      jitter: 0.0,
+      palette: "plasma",
+      additive: true
+    };
+
+    const gui = new GUI();
+    gui.add(params, "mode", MODES).name("Mode");
+    gui.add(params, "pointCount", 2000, 80000, 1000).name("Points").onFinishChange(rebuildAll);
+    gui.add(params, "pointSize", 0.003, 0.05, 0.001).name("Point Size").onChange(()=>{ ptsMat.size = params.pointSize; });
+    gui.add(params, "durationMs", 300, 4000, 50).name("Duration");
+    gui.add(params, "swirlTurns", 0, 3, 0.05).name("Swirl Turns");
+    gui.add(params, "bezierArc", 0, 2, 0.01).name("Bezier Arc");
+    gui.add(params, "dissolveMs", 300, 4000, 50).name("Dissolve/Rebuild ms");
+    gui.add(params, "colorLerp").name("Color Crossfade");
+    gui.add(params, "target", ["sphere","cube"]).name("Target Shape").onFinishChange(triggerTransition);
+    gui.add(params, "jitter", 0, 0.08, 0.001).name("Jitter");
+    gui.add(params, "palette", ["ice","magma","plasma","viridis","rainbow"]).name("Palette").onFinishChange(recolor);
+    gui.add(params, "additive").name("Additive Blend").onChange(toggleBlend);
+
+
+
+
+    // ---------- Point cloud buffers ----------
+    const geom = new THREE.BufferGeometry();
+    const ptsMat = new THREE.PointsMaterial({ size: params.pointSize, vertexColors: true, depthWrite: false, transparent: true });
+    toggleBlend();
+
+    const points = new THREE.Points(geom, ptsMat);
+    scene.add(points);
+
+    // working arrays
+    let A=null, B=null;        // source & target positions (Float32Array length 3N)
+    let C=null;                // current interp positions (Float32Array length 3N)
+    let colA=null, colB=null;  // per-point colors for each shape (Float32Array length 3N)
+    let curCol=null;           // current colors (Float32Array)
+    let perm=null;             // pairing permutation (Uint32Array length N)
+    let delays=null;           // per-point delay for "stagger" (Float32Array length N)
+    let N=0;
+
+    function ensure(Nnew){
+      const need = (!C || C.length !== 3*Nnew);
+      N = Nnew|0;
+      if (need){
+        A = new Float32Array(3*N);
+        B = new Float32Array(3*N);
+        C = new Float32Array(3*N);
+        colA = new Float32Array(3*N);
+        colB = new Float32Array(3*N);
+        curCol = new Float32Array(3*N);
+        perm = new Uint32Array(N);
+        delays = new Float32Array(N);
+
+        geom.setAttribute("position", new THREE.BufferAttribute(C, 3));
+        geom.setAttribute("color", new THREE.BufferAttribute(curCol, 3));
+      }
+    }
+
+    // ---------- Distributions ----------
+    function halton(i, base){
+      let f=1, r=0;
+      while (i>0){ f/=base; r += f * (i%base); i = Math.floor(i/base); }
+      return r;
+    }
+
+    function permutePairing(){
+      // Low-discrepancy pairing using Halton for a nice visual shuffle
+      for (let i=0;i<N;i++){
+        const t = halton(i+1, 2); // in (0,1]
+        perm[i] = Math.floor(t * N) % N;
+      }
+      // Make it a real permutation (resolve collisions by walking forward)
+      const used = new Uint8Array(N);
+      for (let i=0;i<N;i++){
+        let j = perm[i];
+        while (used[j]) j = (j+1)%N;
+        perm[i]=j; used[j]=1;
+      }
+      // Stagger delays: another LDS with slight randomness
+      for (let i=0;i<N;i++){
+        delays[i] = halton(i+1,3); // 0..1
+      }
+    }
+
+    // Sphere via Fibonacci lattice, radius ~1
+    function buildSphere(dst){
+      const r = 1.0;
+      const g = (1 + Math.sqrt(5)) / 2;
+      for (let i=0;i<N;i++){
+        const t = (i+0.5)/N;
+        const phi = 2*Math.PI * (i/g % 1);
+        const z = 1 - 2*t;
+        const rho = Math.sqrt(Math.max(0, 1 - z*z));
+        const x = Math.cos(phi) * rho;
+        const y = Math.sin(phi) * rho;
+        dst[3*i]=r*x; dst[3*i+1]=r*y; dst[3*i+2]=r*z;
+      }
+    }
+
+    // Cube surface-ish sampling with slight Poisson feel via jitter
+    function buildCube(dst){
+      const s = 1.2; // a bit larger than sphere so transitions feel dynamic
+      for (let i=0;i<N;i++){
+        // choose a face
+        const f = (i*2654435761>>>0) % 6;
+        let x = Math.random()*2-1, y = Math.random()*2-1, z = Math.random()*2-1;
+        if (f===0){ x = -1; } else if (f===1){ x = 1; }
+        else if (f===2){ y = -1; } else if (f===3){ y = 1; }
+        else if (f===4){ z = -1; } else { z = 1; }
+        // place randomly on face
+        if (f<2){ y = 2*Math.random()-1; z = 2*Math.random()-1; }
+        else if (f<4){ x = 2*Math.random()-1; z = 2*Math.random()-1; }
+        else { x = 2*Math.random()-1; y = 2*Math.random()-1; }
+
+        dst[3*i]=s*x; dst[3*i+1]=s*y; dst[3*i+2]=s*z;
+      }
+    }
+
+    // Color palettes
+    function lerp(a,b,t){ return a+(b-a)*t; }
+    function palette(name, t){
+      // t in [0,1]
+      if (name==="ice")     return [ lerp(0.6,0.9,t), lerp(0.8,1.0,t), lerp(1.0,1.0,t) ];
+      if (name==="magma")   return [ Math.pow(t,0.6), Math.pow(t,2.2)*0.2, Math.pow(t,3.0)*0.05 ];
+      if (name==="viridis") return [ 0.267+0.624*t, 0.004+0.676*t, 0.329+0.314*t ];
+      if (name==="rainbow") return hsv2rgb(t, 0.85, 1.0);
+      // plasma-ish
+      const a = 0.5 + 0.5*Math.sin(6.28318*(t*0.9));
+      return [ 0.5+0.5*t, 0.05+0.9*a, 0.3+0.7*(1-t) ];
+    }
+    function hsv2rgb(h,s,v){
+      const i = Math.floor(h*6); const f = h*6 - i; const p = v*(1-s); const q = v*(1-f*s); const t = v*(1-(1-f)*s);
+      switch(i%6){
+      case 0: return [v,t,p];
+      case 1: return [q,v,p];
+      case 2: return [p,v,t];
+      case 3: return [p,q,v];
+      case 4: return [t,p,v];
+      case 5: return [v,p,q];
+      }
+    }
+
+    function colorize(dst, kind){
+      // map by normalized position projected to [0,1]
+      const tmp = [0,0,0];
+      for (let i=0;i<N;i++){
+        const x = kind[3*i], y = kind[3*i+1], z = kind[3*i+2];
+        // squash to [-1.3..1.3] roughly
+        const t = THREE.MathUtils.clamp((Math.hypot(x,y,z)/1.4), 0, 1);
+        const c = palette(params.palette, t);
+        tmp[0]=c[0]; tmp[1]=c[1]; tmp[2]=c[2];
+        dst[3*i]=tmp[0]; dst[3*i+1]=tmp[1]; dst[3*i+2]=tmp[2];
+      }
+    }
+
+    function recolor(){
+      colorize(colA, A);
+      colorize(colB, B);
+      // refresh current immediately
+      applyColor(0);
+      geom.getAttribute('color').needsUpdate = true;
+    }
+
+    function toggleBlend(){
+      ptsMat.blending = params.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
+      ptsMat.needsUpdate = true;
+    }
+
+    // ---------- Transition engine ----------
+    let t0 = performance.now();
+    let animMs = params.durationMs;
+    let phase = "idle"; // "morphing" | "dissolving" | "rebuilding"
+    let paused = false;
+    let targetIsSphere = true;
+    let dissolveVel = null; // Float32Array length 3N
+
+    function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
+    function easeOutExpo(t){ return t===1?1:1 - Math.pow(2, -10*t); }
+
+    function applyColor(tMix){
+      if (!params.colorLerp){ curCol.set(colB); return; }
+      const t = THREE.MathUtils.clamp(tMix, 0, 1);
+      const a = 1 - t, b = t;
+      for (let i=0;i<3*N;i++) curCol[i] = a*colA[i] + b*colB[i];
+    }
+
+  function jitterVec(i){
+    const j = params.jitter;
+    if (j<=0) return [0,0,0];
+      // tiny deterministic jitter based on index
+    const r1 = ( (i*16807)%2147483647 ) / 2147483647;
+    const r2 = ( (i*48271)%2147483647 ) / 2147483647;
+    const r3 = ( (i*69621)%2147483647 ) / 2147483647;
+    return [ (r1-0.5)*2*j, (r2-0.5)*2*j, (r3-0.5)*2*j ];
+  }
+
+  function rotateY(vx,vy,vz, ang){
+    const c=Math.cos(ang), s=Math.sin(ang);
+    return [ c*vx + s*vz, vy, -s*vx + c*vz ];
+  }
+
+  function bezierPoint(ax,ay,az, bx,by,bz, t, arc){
+      // control point = midpoint offset by normal-ish vector scaled by arc
+    const mx = (ax+bx)/2, my=(ay+by)/2, mz=(az+bz)/2;
+      // normal from cross with a fixed axis to avoid degeneracy
+      let nx=-(by-ay), ny=(bx-ax), nz=0; // pseudo-orthogonal
+      const L = Math.hypot(nx,ny,nz)||1; nx/=L; ny/=L; nz/=L;
+      const cx = mx + nx*arc, cy = my + ny*arc, cz = mz + nz*arc;
+      // Quadratic Bezier
+      const u = 1-t;
+      return [
+        u*u*ax + 2*u*t*cx + t*t*bx,
+        u*u*ay + 2*u*t*cy + t*t*by,
+        u*u*az + 2*u*t*cz + t*t*bz
+      ];
+    }
+
+    function startMorph(){
+      phase = "morphing";
+      animMs = params.durationMs;
+      t0 = performance.now();
+    }
+
+    function startDissolveRebuild(){
+      // prepare velocities outwards
+      if (!dissolveVel || dissolveVel.length !== 3*N) dissolveVel = new Float32Array(3*N);
+      for (let i=0;i<N;i++){
+        const bx = A[3*i], by=A[3*i+1], bz=A[3*i+2];
+        const L = Math.hypot(bx,by,bz)||1;
+        const dx = bx/L, dy=by/L, dz=bz/L;
+        const s = 1.2 + Math.random()*0.8;
+        dissolveVel[3*i]=dx*s; dissolveVel[3*i+1]=dy*s; dissolveVel[3*i+2]=dz*s;
+      }
+      phase = "dissolving";
+      animMs = params.dissolveMs;
+      t0 = performance.now();
+    }
+
+    function triggerTransition(){
+      // swap A<->B according to target
+      if (params.target==="sphere") targetIsSphere = true; else targetIsSphere = false;
+      // A = current “from”, B = desired “to”
+      if (targetIsSphere){
+        buildSphere(B);
+        buildCube(A);
+      } else {
+        buildCube(B);
+        buildSphere(A);
+      }
+      recolor();
+      // Fresh pairing keeps things lively
+      permutePairing();
+
+      if (params.mode==="dissolve") startDissolveRebuild();
+      else startMorph();
+    }
+
+    function rebuildAll(){
+      ensure(params.pointCount|0);
+      buildSphere(B);
+      buildCube(A);
+      recolor();
+      permutePairing();
+      // initialize cloud at A
+      C.set(A);
+      applyColor(0);
+      geom.getAttribute('position').needsUpdate = true;
+      geom.getAttribute('color').needsUpdate = true;
+      geom.computeBoundingSphere();
+      overlay.textContent = `N=${N} | mode=${params.mode}`;
+    }
+
+    // ---------- Animation loop ----------
+    let lastT = performance.now();
+
+    function step(){
+      const now = performance.now();
+      const dt = (now - lastT)/1000; lastT = now;
+      if (!paused){
+        update(now);
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      requestAnimationFrame(step);
+    }
+
+    function update(now){
+      // choose interpolator based on mode
+      if (phase==="idle") return;
+
+      const tRaw = THREE.MathUtils.clamp((now - t0) / animMs, 0, 1);
+      const tEase = (params.mode==="stagger") ? tRaw : easeInOutCubic(tRaw);
+
+      if (phase==="morphing"){
+        const mode = params.mode;
+        const turns = params.swirlTurns;
+        const arc = params.bezierArc;
+
+        if (mode==="stagger"){
+          // points start later depending on delays[i]
+          const span = params.durationMs;
+          for (let i=0;i<N;i++){
+            const start = delays[i]*0.7*span; // up to 70% delay
+            const local = THREE.MathUtils.clamp((now - (t0+start)) / (span - start), 0, 1);
+            const tt = easeOutExpo(local);
+            const j = perm[i];
+            const ax = A[3*i], ay=A[3*i+1], az=A[3*i+2];
+            const bx = B[3*j], by=B[3*j+1], bz=B[3*j+2];
+            const [jx,jy,jz] = jitterVec(i);
+            C[3*i]   = ax*(1-tt) + (bx+jx)*tt;
+            C[3*i+1] = ay*(1-tt) + (by+jy)*tt;
+            C[3*i+2] = az*(1-tt) + (bz+jz)*tt;
+          }
+          applyColor(tRaw);
+        }
+        else if (mode==="morph"){
+          for (let i=0;i<N;i++){
+            const j = perm[i];
+            const ax = A[3*i], ay=A[3*i+1], az=A[3*i+2];
+            const bx = B[3*j], by=B[3*j+1], bz=B[3*j+2];
+            const [jx,jy,jz] = jitterVec(i);
+            const t = tEase;
+            C[3*i]   = ax*(1-t) + (bx+jx)*t;
+            C[3*i+1] = ay*(1-t) + (by+jy)*t;
+            C[3*i+2] = az*(1-t) + (bz+jz)*t;
+          }
+          applyColor(tEase);
+        }
+        else if (mode==="swirl"){
+          // rotate source backward while blending to target
+          const theta = (1 - tEase) * turns * Math.PI*2;
+          for (let i=0;i<N;i++){
+            const j = perm[i];
+            let ax = A[3*i], ay=A[3*i+1], az=A[3*i+2];
+            [ax,ay,az] = rotateY(ax,ay,az, theta);
+            const bx = B[3*j], by=B[3*j+1], bz=B[3*j+2];
+            const [jx,jy,jz] = jitterVec(i);
+            C[3*i]   = ax*(1-tEase) + (bx+jx)*tEase;
+            C[3*i+1] = ay*(1-tEase) + (by+jy)*tEase;
+            C[3*i+2] = az*(1-tEase) + (bz+jz)*tEase;
+          }
+          applyColor(tEase);
+        }
+        else if (mode==="bezier"){
+          for (let i=0;i<N;i++){
+            const j = perm[i];
+            const ax = A[3*i], ay=A[3*i+1], az=A[3*i+2];
+            const bx = B[3*j], by=B[3*j+1], bz=B[3*j+2];
+            const [px,py,pz] = bezierPoint(ax,ay,az, bx,by,bz, tEase, arc);
+            const [jx,jy,jz] = jitterVec(i);
+            C[3*i]   = px + jx*(1-tEase);
+            C[3*i+1] = py + jy*(1-tEase);
+            C[3*i+2] = pz + jz*(1-tEase);
+          }
+          applyColor(tEase);
+        }
+
+        geom.getAttribute('position').needsUpdate = true;
+        geom.getAttribute('color').needsUpdate = true;
+        if (tRaw>=1){
+          // landed: swap roles so next trigger goes the other way without recomputing
+          const tmpP = A; A = B; B = tmpP;
+          const tmpC = colA; colA = colB; colB = tmpC;
+          phase="idle";
+        }
+      }
+      else if (phase==="dissolving"){
+        // fly outward & fade
+        const tt = tRaw;
+        const fade = 1 - tt;
+        ptsMat.opacity = fade;
+        for (let i=0;i<N;i++){
+          C[3*i]   = A[3*i]   + dissolveVel[3*i]  * tt*1.0;
+          C[3*i+1] = A[3*i+1] + dissolveVel[3*i+1]* tt*1.0;
+          C[3*i+2] = A[3*i+2] + dissolveVel[3*i+2]* tt*1.0;
+        }
+        geom.getAttribute('position').needsUpdate = true;
+
+        if (tt>=1){
+          // snap to far-away cloud, then start rebuild toward B
+          for (let i=0;i<N;i++){
+            C[3*i]   = (Math.random()*2-1)*3.5;
+            C[3*i+1] = (Math.random()*2-1)*3.5;
+            C[3*i+2] = (Math.random()*2-1)*3.5;
+          }
+          ptsMat.opacity = 0.0;
+          phase = "rebuilding";
+          animMs = params.dissolveMs;
+          t0 = performance.now();
+        }
+      }
+      else if (phase==="rebuilding"){
+        const tt = easeInOutCubic((now - t0)/animMs);
+        ptsMat.opacity = tt;
+        for (let i=0;i<N;i++){
+          const j = perm[i];
+          const bx = B[3*j], by=B[3*j+1], bz=B[3*j+2];
+          const [jx,jy,jz] = jitterVec(i);
+          // move from scattered C (as start) toward B
+          C[3*i]   = C[3*i]  *(1-tt) + (bx+jx)*tt;
+          C[3*i+1] = C[3*i+1]*(1-tt) + (by+jy)*tt;
+          C[3*i+2] = C[3*i+2]*(1-tt) + (bz+jz)*tt;
+        }
+        applyColor(tt);
+        geom.getAttribute('position').needsUpdate = true;
+        geom.getAttribute('color').needsUpdate = true;
+
+        if ( (now-t0) >= animMs ){
+          // finished: swap roles
+          const tmpP = A; A = B; B = tmpP;
+          const tmpC = colA; colA = colB; colB = tmpC;
+          phase = "idle";
+          ptsMat.opacity = 1.0;
+        }
+      }
+    }
+
+    // ---------- Input ----------
+    window.addEventListener("keydown",(e)=>{
+      const k=e.key.toLowerCase();
+      if (k===" "){ triggerTransition(); }
+      else if (k==="c"){ params.target = (params.target==="sphere"?"cube":"sphere"); triggerTransition(); }
+      else if (k==="r"){ permutePairing(); triggerTransition(); }
+      else if (k==="p"){ paused = !paused; }
+      else if (k==="f"){ toggleFullscreen(); }
+      else if (k==="1"){ params.mode = MODES["1 · Morph (ease)"]; startMorph(); }
+      else if (k==="2"){ params.mode = MODES["2 · Swirl Morph"]; startMorph(); }
+      else if (k==="3"){ params.mode = MODES["3 · Bezier Flow"]; startMorph(); }
+      else if (k==="4"){ params.mode = MODES["4 · Dissolve/Rebuild"]; startDissolveRebuild(); }
+      else if (k==="5"){ params.mode = MODES["5 · Staggered Build"]; startMorph(); }
+      overlay.textContent = `N=${N} | mode=${params.mode}`;
+    });
+
+    async function toggleFullscreen(){
+      try{
+        if (!document.fullscreenElement) await document.body.requestFullscreen({navigationUI:"hide"}).catch(()=>document.body.requestFullscreen());
+        else await document.exitFullscreen();
+      }catch(e){}
+    }
+
+    // ---------- Boot ----------
+    rebuildAll();
+    triggerTransition();
+    step();
+
+    window.addEventListener('resize', ()=>{
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      if (paused) renderer.render(scene,camera);
+    });
+  </script>
+</body>
+</html>
