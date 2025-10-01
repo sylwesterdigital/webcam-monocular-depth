@@ -380,6 +380,8 @@
   let hand1Points = null;
 let handSteamMat = null;   // used by applyHandSteamSize() and rebuildHandSteam()
 
+let hsSize=null, hsAge=null, hsSeed=null, hsLifeTotal=null;
+
 
 // helpers (local to this block)
 function isARSession(){
@@ -447,6 +449,7 @@ gHands.add(params, "handBrightness", 0.5, 3.0, 0.05).name("Brightness").onChange
 Object.assign(params, {
   handSteamEnabled: true,
   handSteamCount: 11000,
+  handSteamSpeed: 1.0,
 
   // NEW: dual-unit sizing + legacy mirror
   handSteamSizePx: 3.0,        // AR: pixels
@@ -461,10 +464,32 @@ Object.assign(params, {
 
   handSteamAttractEnabled: true,
   handSteamAttractStrength: 5.5,
-  handSteamAttractMax: 0.55
+  handSteamAttractMax: 0.55,
+
+  handSteamShape: "soft",          // "soft" | "circle" | "triangle" | "spark"
+  handSteamSizeMin: 0.6,           // multiplies material size
+  handSteamSizeMax: 1.8,
+  handSteamAlphaMode: "smootherstep", // "linear" | "smoothstep" | "smootherstep"
+  handSteamDepthNoise: 0.018,      // meters of z-wobble (adds volume)
+  handSteamTurbulenceHz: 1.6       // animation speed for wobble
+
+
+
+
 });
 
+
+let steamTime = 0;
 const gSteam = gui.addFolder("Hand Steam");
+
+// BEFORE: it scaled hsVel ... remove that scaling
+gSteam.add(params, "handSteamSpeed", 0.05, 2.0, 0.01).name("Speed")
+.onChange(v => {
+    gSteam.__prevSteamSpeed = v;  // keep for GUI state only
+  });
+
+
+
 gSteam.add(params, "handSteamEnabled").name("Enabled").onChange(v=>{
   if (handSteamPoints) handSteamPoints.visible = !!v;
 });
@@ -481,6 +506,14 @@ gSteam.add(params, "handSteamBirthsPerFrame", 0, 5000, 10).name("Births / frame"
 gSteam.add(params, "handSteamUpVel", 0.0, 2.0, 0.01).name("Upward m/s");
 gSteam.add(params, "handSteamSpread", 0.001, 0.06, 0.001).name("Spawn Spread (m)");
 gSteam.add(params, "handSteamDrag", 0.0, 4.0, 0.01).name("Drag (1/s)");
+
+gSteam.add(params, "handSteamShape", ["soft","circle","triangle","spark"]).name("Billboard");
+gSteam.add(params, "handSteamSizeMin", 0.1, 3.0, 0.05).name("Size Min");
+gSteam.add(params, "handSteamSizeMax", 0.1, 3.0, 0.05).name("Size Max");
+gSteam.add(params, "handSteamAlphaMode", ["linear","smoothstep","smootherstep"]).name("Alpha Curve");
+gSteam.add(params, "handSteamDepthNoise", 0.0, 0.06, 0.001).name("Depth Noise (m)");
+gSteam.add(params, "handSteamTurbulenceHz", 0.1, 6.0, 0.1).name("Turbulence (Hz)");
+
 
 const gSteamAttr = gSteam.addFolder("Attractor");
 gSteamAttr.add(params, "handSteamAttractEnabled").name("Enabled")
@@ -665,7 +698,6 @@ function currentState(){
 
 
 
-
 function applyState(state, { silent = false } = {}) {
   try {
     if (!state) return;
@@ -702,9 +734,8 @@ function applyState(state, { silent = false } = {}) {
       // External point clouds keep in sync with current params
       updateExternalPointMaterials();
 
-      // ---------- HANDS + HAND STEAM (make presets stick) ----------
-      // Make legacy mirrors match current session (AR vs VR) first,
-      // then push sizes into materials.
+      // ---------- HANDS + HAND STEAM ----------
+      // Keep unit-mirrors (px vs m) in sync with current XR mode, then push sizes.
       syncComputedHandSizes();
 
       if (hand0Points?.material) applyHandPointSizeTo(hand0Points.material);
@@ -723,7 +754,18 @@ function applyState(state, { silent = false } = {}) {
       if (typeof attractorSphere !== "undefined" && attractorSphere) {
         attractorSphere.visible = !!params.handSteamAttractEnabled;
       }
-      // -------------------------------------------------------------
+
+      // Hand Steam speed → scale existing velocities immediately (like rain)
+      //   (() => {
+      //     if (!hsVel || typeof params.handSteamSpeed !== "number") return;
+      //     const prev = (gSteam && gSteam.__prevSteamSpeed) ? gSteam.__prevSteamSpeed : 1;
+      //     if (prev > 0 && prev !== params.handSteamSpeed) {
+      //       const s = params.handSteamSpeed / prev;
+      //       for (let i = 0; i < hsVel.length; i++) hsVel[i] *= s; // scales all xyz comps
+      //     }
+      //   if (gSteam) gSteam.__prevSteamSpeed = params.handSteamSpeed;
+      // })();
+      // ---------- END HANDS + HAND STEAM ----------
 
       // If server parameters were restored, send them up
       pushServerParams();
@@ -793,7 +835,6 @@ function applyState(state, { silent = false } = {}) {
     console.warn("[state] applyState failed", e);
   }
 }
-
 
 
 
@@ -881,6 +922,96 @@ window.addEventListener("beforeunload", scheduleAutosave);
 
 
   // Smooth alpha fade - WIP
+
+
+function attachSteamShader(mat){
+  const user = mat.userData;
+  user.steamUniforms = {
+    uTime:        { value: 0 },
+    uDepthNoise:  { value: params.handSteamDepthNoise },
+    uTurbHz:      { value: params.handSteamTurbulenceHz },
+    uAlphaMode:   { value: 2 } // 0:linear, 1:smoothstep, 2:smootherstep
+  };
+
+  const prevOBC = mat.onBeforeCompile;
+  mat.onBeforeCompile = (shader)=>{
+    // chain any previous hook (e.g., depth fade)
+    if (prevOBC) prevOBC(shader);
+
+    // wire uniforms up
+    shader.uniforms.uTime       = user.steamUniforms.uTime;
+    shader.uniforms.uDepthNoise = user.steamUniforms.uDepthNoise;
+    shader.uniforms.uTurbHz     = user.steamUniforms.uTurbHz;
+    shader.uniforms.uAlphaMode  = user.steamUniforms.uAlphaMode;
+
+    // ---- VERTEX: declare uniforms + attributes and add wobble ----
+    shader.vertexShader = shader.vertexShader
+      // declare our uniforms at top
+    .replace(
+      'void main() {',
+      `
+uniform float uTime;
+uniform float uDepthNoise;
+uniform float uTurbHz;
+
+attribute float aSize;
+attribute float aAge;
+attribute float aSeed;
+varying float vAge;
+
+void main() {
+      `
+      )
+      // pass age + z wobble
+    .replace(
+      '#include <begin_vertex>',
+      `
+#include <begin_vertex>
+vAge = aAge;
+
+// depth wobble: subtle z noise to fake volume
+float wob = sin(aSeed + uTime * 6.28318 * uTurbHz) * uDepthNoise;
+transformed.z += wob;
+      `
+      )
+      // scale point size by per-particle size attribute
+    .replace(
+      'gl_PointSize = size;',
+      'gl_PointSize = size * aSize;'
+      );
+
+    // ---- FRAGMENT: declare uniform + alpha curve ----
+    shader.fragmentShader = shader.fragmentShader
+    .replace(
+      'void main() {',
+      `
+uniform int uAlphaMode;
+varying float vAge;
+
+float alphaCurve(float t){
+  t = clamp(t, 0.0, 1.0);
+  if (uAlphaMode==0) return t;
+  if (uAlphaMode==1) return t*t*(3.0-2.0*t);                // smoothstep
+  return t*t*t*(t*(6.0*t-15.0)+10.0);                       // smootherstep
+}
+
+void main() {
+      `
+      )
+    .replace(
+      '#include <alphatest_fragment>',
+      `
+#include <alphatest_fragment>
+// fade-in then out: map age 0..1 to a bell curve
+float a = (vAge < 0.5) ? alphaCurve(vAge*2.0) : alphaCurve((1.0 - vAge)*2.0);
+diffuseColor.a *= a;
+      `
+      );
+  };
+
+  mat.needsUpdate = true;
+  return mat;
+}
 
 
 function attachDepthFadeToPointsMaterial(mat){
@@ -1023,7 +1154,7 @@ const springC = 2 * Math.sqrt(springK); // critical damping
 
 
 
-    // point sprite textures
+// point sprite textures
 let shapeTexture = null;
 function makeCircleTexture(size=64, feather=1.5){
   const c = document.createElement('canvas'); c.width=c.height=size;
@@ -1051,6 +1182,49 @@ function makeCrossTexture(size=64, thickness=0.22, feather=1.25){
   ctx.putImageData(img,0,0);
   const tex=new THREE.CanvasTexture(c); tex.minFilter=tex.magFilter=THREE.LinearFilter; tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping; return tex;
 }
+
+function makeSteamTexture(kind="soft", size=64){
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  const cx=size/2, cy=size/2, r=size*0.48;
+
+  const putA = (x,y,a)=>{
+    const i=(y*size+x)*4; img.data[i]=img.data[i+1]=img.data[i+2]=255; img.data[i+3]=Math.max(0,Math.min(255,Math.round(a*255)));
+  };
+
+  for (let y=0;y<size;y++) for (let x=0;x<size;x++){
+    const dx=x+0.5-cx, dy=y+0.5-cy;
+    const d=Math.hypot(dx,dy)/r;
+
+    let a=0;
+    if (kind==="soft"){
+      // gentle gaussian-ish blob
+      const t=Math.max(0,1-d);
+      a = Math.pow(t, 2.2);
+    } else if (kind==="circle"){
+      a = d<=1 ? 1 : 0;
+    } else if (kind==="triangle"){
+      // soft triangular-ish falloff
+      const t=Math.max(0,1-d);
+      a = Math.pow(t, 1.3);
+    } else { // "spark"
+      const ang = Math.atan2(dy,dx);
+      const rays = Math.abs(Math.cos(ang*4.0))*0.6+0.4;
+      const t = Math.max(0, 1 - d*rays);
+      a = Math.pow(t, 2.0);
+    }
+    putA(x,y,a);
+  }
+
+  ctx.putImageData(img,0,0);
+  const tex=new THREE.CanvasTexture(c);
+  tex.minFilter=tex.magFilter=THREE.LinearFilter;
+  tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping;
+  return tex;
+}
+
+
 
     // --- NEW BLOCK: External model groups state (place after params) ---
     let externalGroups = []; // [{ id, name, group, points, material, basePositions, baseColors, density, visible }]
@@ -1497,63 +1671,71 @@ function setPointShape(){
 
 
   function rebuildHandSteam(count){
-  // Clamp + normalize
     count = Math.max(0, Math.min(20000, count | 0));
 
-  // Tear down old
     if (handSteamPoints){
       scene.remove(handSteamPoints);
       handSteamGeom?.dispose();
       handSteamMat?.dispose();
     }
 
-  // Buffers
     handSteamGeom = new THREE.BufferGeometry();
     hsPos  = new Float32Array(count * 3);
     hsCol  = new Float32Array(count * 3);
     hsVel  = new Float32Array(count * 3);
     hsLife = new Float32Array(count);
+  hsAge  = new Float32Array(count);        // 0..1
+  hsSize = new Float32Array(count);        // per-particle multiplier
+  hsSeed = new Float32Array(count);        // random phase for wobble
+  hsLifeTotal = new Float32Array(count);   // to compute age fraction
 
-    const [cr, cg, cb] = params.handSteamColor;
-    for (let i = 0; i < count; i++){
-      const b = 3 * i;
-    // park offscreen until spawned
-      hsPos[b] = hsPos[b+1] = hsPos[b+2] = 9999;
-      hsVel[b] = hsVel[b+1] = hsVel[b+2] = 0;
-      hsLife[i] = 0;
-      hsCol[b] = cr; hsCol[b+1] = cg; hsCol[b+2] = cb;
-    }
+  const [cr,cg,cb] = params.handSteamColor;
+  for (let i=0;i<count;i++){
+    const b=3*i;
+    hsPos[b]=hsPos[b+1]=hsPos[b+2]=9999;
+    hsVel[b]=hsVel[b+1]=hsVel[b+2]=0;
+    hsLife[i]=0;
+    hsAge[i]=0;
+    hsSize[i]=1;
+    hsSeed[i]=Math.random()*1000.0;
+    hsLifeTotal[i]=1;
+    hsCol[b]=cr; hsCol[b+1]=cg; hsCol[b+2]=cb;
+  }
 
-  // Attributes (dynamic, we update every frame)
-    const aPos = new THREE.BufferAttribute(hsPos, 3);
-    const aCol = new THREE.BufferAttribute(hsCol, 3);
-    aPos.setUsage?.(THREE.DynamicDrawUsage);
-    aCol.setUsage?.(THREE.DynamicDrawUsage);
-    handSteamGeom.setAttribute('position', aPos);
-    handSteamGeom.setAttribute('color',    aCol);
+  const aPos = new THREE.BufferAttribute(hsPos,3);
+  const aCol = new THREE.BufferAttribute(hsCol,3);
+  aPos.setUsage?.(THREE.DynamicDrawUsage);
+  aCol.setUsage?.(THREE.DynamicDrawUsage);
 
-  // Material (unit-safe; actual size applied below)
-    const ar = isARSession();
-    handSteamMat = new THREE.PointsMaterial({
-      size: ar ? params.handSteamSizePx : params.handSteamSizeWorld,
-      vertexColors: true,
-    sizeAttenuation: !ar,     // AR: pixel size; VR/Desktop: world-attenuated
+  handSteamGeom.setAttribute('position', aPos);
+  handSteamGeom.setAttribute('color',    aCol);
+  handSteamGeom.setAttribute('aSize', new THREE.BufferAttribute(hsSize,1));
+  handSteamGeom.setAttribute('aAge',  new THREE.BufferAttribute(hsAge,1));
+  handSteamGeom.setAttribute('aSeed', new THREE.BufferAttribute(hsSeed,1));
+
+  const ar = isARSession();
+  handSteamMat = new THREE.PointsMaterial({
+    size: ar ? params.handSteamSizePx : params.handSteamSizeWorld,
+    vertexColors: true,
+    sizeAttenuation: !ar,
     transparent: true,
-    depthWrite: false
+    depthWrite: false,
+    map: makeSteamTexture(params.handSteamShape)
   });
-    attachDepthFadeToPointsMaterial(handSteamMat);
 
-  // Points
-    handSteamPoints = new THREE.Points(handSteamGeom, handSteamMat);
-    handSteamPoints.frustumCulled = false;
-    handSteamPoints.visible = !!params.handSteamEnabled;
-    scene.add(handSteamPoints);
+  attachDepthFadeToPointsMaterial(handSteamMat);
+  attachSteamShader(handSteamMat);
 
-  // Reset circular writer and ensure sizing mirrors are in sync
-    handSteamNext = 0;
-    syncComputedHandSizes();
-  applyHandSteamSize();        // picks px vs m based on current session
+  handSteamPoints = new THREE.Points(handSteamGeom, handSteamMat);
+  handSteamPoints.frustumCulled = false;
+  handSteamPoints.visible = !!params.handSteamEnabled;
+  scene.add(handSteamPoints);
+
+  handSteamNext = 0;
+  syncComputedHandSizes();
+  applyHandSteamSize();
 }
+
 
 // Build once from current preset
 rebuildHandSteam(params.handSteamCount | 0);
@@ -1584,85 +1766,136 @@ function spawnHandSteam(n){
 
   const spread = params.handSteamSpread;
   for (let k=0;k<n;k++){
-    const j = (Math.random()*J)|0;
-    const j3 = j*3;
+    const j = (Math.random()*J)|0, j3=j*3;
     const jx=joints[j3], jy=joints[j3+1], jz=joints[j3+2];
 
-    // random offset around joint
     let ox,oy,oz,L;
     do { ox=Math.random()*2-1; oy=Math.random()*2-1; oz=Math.random()*2-1; L=ox*ox+oy*oy+oz*oz; } while (L>1 || L===0);
     ox*=spread; oy*=spread; oz*=spread;
 
     const i = handSteamNext;
     handSteamNext = (handSteamNext + 1) % hsLife.length;
+    const b=3*i;
 
-    const b = 3*i;
     hsPos[b]   = jx + ox;
     hsPos[b+1] = jy + oy;
     hsPos[b+2] = jz + oz;
 
-    const up = params.handSteamUpVel;
+    // BEFORE: const up = params.handSteamUpVel * params.handSteamSpeed;
+    const up = params.handSteamUpVel;  // NO speed factor here
+
     hsVel[b]   = (Math.random()*2-1) * up*0.15;
     hsVel[b+1] = up * (0.6 + Math.random()*0.6);
     hsVel[b+2] = (Math.random()*2-1) * up*0.15;
 
-    hsLife[i] = 0.9 + Math.random()*1.0; // seconds
+    // Lifespan: scale by time-scale so wall-clock life stays the same
+    // const baseLife = 0.9 + Math.random()*1.0;     // your original distribution (seconds)
+    // const s        = Math.max(0, params.handSteamSpeed);
+    // const lifeSim  = baseLife * s;                // sim-time life so (lifeSim / s) == baseLife (wall-clock)
+    // hsLife[i]      = lifeSim;
+    // hsLifeTotal[i] = lifeSim;
+    // hsAge[i]       = 0.0;
+
+    // REPLACE this in spawnHandSteam(...)
+    const baseLife = 0.9 + Math.random()*1.0;
+    const lifeSim  = baseLife;      // ← no speed factor
+    hsLife[i]      = lifeSim;
+    hsLifeTotal[i] = lifeSim;
+    hsAge[i]       = 0.0;
+
+
+
+    const smin = Math.min(params.handSteamSizeMin, params.handSteamSizeMax);
+    const smax = Math.max(params.handSteamSizeMin, params.handSteamSizeMax);
+    hsSize[i] = smin + Math.random()*(smax - smin);
+
+        // randomize wobble phase a bit more
+    hsSeed[i] = Math.random()*1000.0;
   }
+
+  handSteamGeom.getAttribute('aSize').needsUpdate = true;
+  handSteamGeom.getAttribute('aSeed').needsUpdate = true;
 }
+
 
 // step simulation
 function stepHandSteam(dt){
   if (!handSteamPoints || !params.handSteamEnabled) return;
 
-  // births
-  spawnHandSteam(Math.min(params.handSteamBirthsPerFrame|0, hsLife.length));
+  // --- time-scale (ONLY place speed applies) ---
+  const s   = Math.max(0, params.handSteamSpeed);
+  const dts = dt * s;
 
+  // --- births: scale by speed to keep density roughly constant across speeds ---
+  const births = Math.min(((params.handSteamBirthsPerFrame|0) * (s || 0)), hsLife.length);
+  if (births > 0) spawnHandSteam(births|0);
+
+  // --- attractor setup (no hidden speed multipliers) ---
   const attractON = params.handSteamAttractEnabled && attractorSphere?.visible;
-  const ax = attractorSphere.position.x, ay = attractorSphere.position.y, az = attractorSphere.position.z;
+  let ax=0, ay=0, az=0;
+  if (attractON){ ax = attractorSphere.position.x; ay = attractorSphere.position.y; az = attractorSphere.position.z; }
   const maxD = Math.max(1e-6, params.handSteamAttractMax);
   const invMax = 1.0 / maxD;
-  const strength = params.handSteamAttractStrength;
+  const strength = params.handSteamAttractStrength; // NO * s
 
+  // --- drag uses scaled dt ---
   const drag = Math.max(0, params.handSteamDrag);
-  const damp = Math.exp(-drag * dt); // stable damping
+  const damp = Math.exp(-drag * dts);
 
-  for (let i=0;i<hsLife.length;i++){
+  for (let i = 0, n = hsLife.length; i < n; i++){
     if (hsLife[i] <= 0) continue;
-    hsLife[i] -= dt;
-    const b=3*i;
 
-    // attraction (only when close)
+    // age in scaled time (so visuals time-stretch with speed)
+    hsLife[i] -= dts;
+    hsAge[i]   = 1.0 - Math.max(0, hsLife[i]) / Math.max(1e-5, hsLifeTotal[i]);
+
+    const b = 3*i;
+
+    // attractor
     if (attractON){
       const dx = ax - hsPos[b];
       const dy = ay - hsPos[b+1];
       const dz = az - hsPos[b+2];
-      const d  = Math.hypot(dx,dy,dz);
-      if (d < maxD && d > 1e-4){
-        const t = 1.0 - d*invMax; // 0..1 (closer => stronger)
-        const acc = strength * t; // m/s^2
-        const sx = dx/d, sy = dy/d, sz = dz/d;
-        hsVel[b]   += sx * acc * dt;
-        hsVel[b+1] += sy * acc * dt;
-        hsVel[b+2] += sz * acc * dt;
+      const d  = Math.hypot(dx, dy, dz);
+      if (d > 1e-4 && d < maxD){
+        const t   = 1.0 - d * invMax;
+        const acc = strength * t;            // NO extra * s
+        const invd = 1.0 / d;
+        hsVel[b]   += dx * invd * acc * dts; // integrate with dts
+        hsVel[b+1] += dy * invd * acc * dts;
+        hsVel[b+2] += dz * invd * acc * dts;
       }
     }
 
-    // damping
-    hsVel[b]   *= damp;
-    hsVel[b+1] *= damp;
-    hsVel[b+2] *= damp;
+    // drag + integrate with scaled time
+    hsVel[b]   *= damp; hsVel[b+1] *= damp; hsVel[b+2] *= damp;
+    hsPos[b]   += hsVel[b]   * dts;
+    hsPos[b+1] += hsVel[b+1] * dts;
+    hsPos[b+2] += hsVel[b+2] * dts;
 
-    // integrate
-    hsPos[b]   += hsVel[b]   * dt;
-    hsPos[b+1] += hsVel[b+1] * dt;
-    hsPos[b+2] += hsVel[b+2] * dt;
-
-    // kill if too far or under floor-like bounds (cheap)
-    if (Math.abs(hsPos[b]) + Math.abs(hsPos[b+1]) + Math.abs(hsPos[b+2]) > 100) hsLife[i] = 0;
+    // safety kill if it explodes numerically or flies away
+    if (!Number.isFinite(hsPos[b]) || !Number.isFinite(hsPos[b+1]) || !Number.isFinite(hsPos[b+2]) ||
+      Math.abs(hsPos[b]) + Math.abs(hsPos[b+1]) + Math.abs(hsPos[b+2]) > 100) {
+      hsLife[i] = 0;
   }
-
-  handSteamGeom.getAttribute('position').needsUpdate = true;
 }
+
+  // push attributes
+const aPos = handSteamGeom.getAttribute('position');
+const aAge = handSteamGeom.getAttribute('aAge');
+if (aPos) aPos.needsUpdate = true;
+if (aAge) aAge.needsUpdate = true;
+
+  // allow live shape swap (unchanged)
+if (handSteamMat && handSteamMat.mapKind !== params.handSteamShape){
+  handSteamMat.map = makeSteamTexture(params.handSteamShape);
+  handSteamMat.mapKind = params.handSteamShape;
+  handSteamMat.needsUpdate = true;
+}
+}
+
+
+
 
 
 
@@ -2019,6 +2252,20 @@ function frame(nowMs){
     updateHandPoints(hand0, hand0Points);
     updateHandPoints(hand1, hand1Points);
 
+
+    // advance steam shader time + reflect GUI changes live
+    if (handSteamPoints?.material?.userData?.steamUniforms){
+      const u = handSteamPoints.material.userData.steamUniforms;
+      
+      steamTime += dt * Math.max(0, params.handSteamSpeed);   // accumulate scaled time
+      u.uTime.value       = steamTime;                        // wobble runs slower/faster
+      u.uDepthNoise.value = params.handSteamDepthNoise;
+      u.uTurbHz.value     = params.handSteamTurbulenceHz;     // leave frequency as-is
+
+      u.uAlphaMode.value =
+      (params.handSteamAlphaMode==="linear") ? 0 :
+      (params.handSteamAlphaMode==="smoothstep") ? 1 : 2;
+    }
 
     renderer.render(scene, camera);
   }
