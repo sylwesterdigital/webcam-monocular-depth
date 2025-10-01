@@ -18,7 +18,10 @@ _redirect_stdio_to_log()
 # --- config (top of file) ---
 HTTPS_PORT = int(os.getenv("HTTPS_PORT", "8443"))
 WSS_PORT   = int(os.getenv("PORT", "8765"))
-APP_HOST   = os.getenv("APP_HOST", "localhost")  # <— single source of truth for host
+
+# APP_HOST   = os.getenv("APP_HOST", "localhost")  # <— single source of truth for host
+APP_HOST   = os.getenv("APP_HOST", "0.0.0.0")
+
 
 CERT_PATH  = os.getenv("HTTPS_CERT_PATH", "certs/localhost+2.pem")
 KEY_PATH   = os.getenv("HTTPS_KEY_PATH",  "certs/localhost+2-key.pem")
@@ -71,13 +74,26 @@ def _wait_for_port(host, port, timeout=15):
             time.sleep(0.1)
     return False
 
+def _lan_ip():
+    # get the current LAN IP without making a real outbound connection
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 80))  # TEST-NET-1 (no traffic actually sent)
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
 def _open_browser():
-    # open exactly the same host we bound to
-    url = f"https://{APP_HOST}:{HTTPS_PORT}/?port={WSS_PORT}"
+    # prefer PUBLIC_HOST env, else auto-detect LAN IP, else localhost
+    public_host = os.getenv("PUBLIC_HOST") or (_lan_ip() if APP_HOST in ("0.0.0.0", "127.0.0.1") else APP_HOST)
+    url = f"https://{public_host}:{HTTPS_PORT}/?port={WSS_PORT}"
     try:
         webbrowser.open_new_tab(url)
     except Exception:
         os.system(f'open "{url}"')
+
 
 
 # ---- Menu-bar status item (Cocoa) ----

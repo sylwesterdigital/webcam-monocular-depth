@@ -471,9 +471,11 @@ Object.assign(params, {
   handSteamSizeMax: 1.8,
   handSteamAlphaMode: "smootherstep", // "linear" | "smoothstep" | "smootherstep"
   handSteamDepthNoise: 0.018,      // meters of z-wobble (adds volume)
-  handSteamTurbulenceHz: 1.6       // animation speed for wobble
+  handSteamTurbulenceHz: 1.6,       // animation speed for wobble
 
-
+  handSteamAttractTurbAmp: 0.35,  // 0..1  → ±35% strength wobble
+  handSteamAttractTurbHz:  0.8,   // Hz    → how fast it wiggles
+  handSteamAttractRangeJitter: 0.25 // 0..1 → ±25% range wobble
 
 
 });
@@ -520,6 +522,12 @@ gSteamAttr.add(params, "handSteamAttractEnabled").name("Enabled")
 .onChange(v=>{ if (attractorSphere) attractorSphere.visible = !!v; });
 gSteamAttr.add(params, "handSteamAttractStrength", 0.0, 12.0, 0.1).name("Strength");
 gSteamAttr.add(params, "handSteamAttractMax", 0.05, 2.5, 0.01).name("Max Distance (m)");
+
+gSteamAttr.add(params, "handSteamAttractTurbAmp", 0.0, 1.0, 0.01).name("Strength Turb (±)");
+gSteamAttr.add(params, "handSteamAttractTurbHz",  0.05, 6.0, 0.05).name("Turbulence Hz");
+gSteamAttr.add(params, "handSteamAttractRangeJitter", 0.0, 1.0, 0.01).name("Range Jitter (±)");
+
+
 
 // initialize legacy mirrors & materials once
 syncComputedHandSizes();
@@ -1818,7 +1826,7 @@ function spawnHandSteam(n){
 }
 
 
-// step simulation
+// step simulation (with turbulent attractor strength & range)
 function stepHandSteam(dt){
   if (!handSteamPoints || !params.handSteamEnabled) return;
 
@@ -1827,20 +1835,37 @@ function stepHandSteam(dt){
   const dts = dt * s;
 
   // --- births: scale by speed to keep density roughly constant across speeds ---
-  const births = Math.min(((params.handSteamBirthsPerFrame|0) * (s || 0)), hsLife.length);
-  if (births > 0) spawnHandSteam(births|0);
+  const births = Math.min(((params.handSteamBirthsPerFrame | 0) * (s || 0)), hsLife.length);
+  if (births > 0) spawnHandSteam(births | 0);
 
   // --- attractor setup (no hidden speed multipliers) ---
   const attractON = params.handSteamAttractEnabled && attractorSphere?.visible;
-  let ax=0, ay=0, az=0;
-  if (attractON){ ax = attractorSphere.position.x; ay = attractorSphere.position.y; az = attractorSphere.position.z; }
-  const maxD = Math.max(1e-6, params.handSteamAttractMax);
-  const invMax = 1.0 / maxD;
-  const strength = params.handSteamAttractStrength; // NO * s
+  let ax = 0, ay = 0, az = 0;
+  if (attractON){
+    ax = attractorSphere.position.x;
+    ay = attractorSphere.position.y;
+    az = attractorSphere.position.z;
+  }
+
+  // base (unmodulated) params
+  const maxDBase   = Math.max(1e-6, params.handSteamAttractMax);
+  const strength01 = params.handSteamAttractStrength; // NO * s
+
+  // turbulence knobs (safe defaults if not present)
+  const turbAmp = Math.max(0, params.handSteamAttractTurbAmp ?? 0);             // 0..1
+  const turbHz  = Math.max(0, params.handSteamAttractTurbHz  ?? 0);             // Hz
+  const rangeJ  = Math.max(0, params.handSteamAttractRangeJitter ?? 0);         // 0..1
 
   // --- drag uses scaled dt ---
   const drag = Math.max(0, params.handSteamDrag);
   const damp = Math.exp(-drag * dts);
+
+  // small sine-noise helper (maps to ~[0,1])
+  const TWO_PI = Math.PI * 2;
+  const noise01 = (ph) => {
+    const n = Math.sin(ph) + 0.5 * Math.sin(ph * 1.7 + 1.234);
+    return 0.5 + n / 3.0;
+  };
 
   for (let i = 0, n = hsLife.length; i < n; i++){
     if (hsLife[i] <= 0) continue;
@@ -1849,19 +1874,32 @@ function stepHandSteam(dt){
     hsLife[i] -= dts;
     hsAge[i]   = 1.0 - Math.max(0, hsLife[i]) / Math.max(1e-5, hsLifeTotal[i]);
 
-    const b = 3*i;
+    const b = 3 * i;
 
-    // attractor
+    // attractor (with turbulence)
     if (attractON){
       const dx = ax - hsPos[b];
-      const dy = ay - hsPos[b+1];
-      const dz = az - hsPos[b+2];
+      const dy = ay - hsPos[b + 1];
+      const dz = az - hsPos[b + 2];
       const d  = Math.hypot(dx, dy, dz);
+
+      // per-particle phase from seed + global steamTime
+      const ph = hsSeed[i] + steamTime * TWO_PI * turbHz;
+
+      // wobble around 1.0: 1 ± turbAmp
+      const wobble = 1.0 + turbAmp * (noise01(ph) * 2.0 - 1.0);
+
+      // range jitter around 1.0, clamped so it stays positive
+      const rangeMul = Math.max(0.05, 1.0 + rangeJ * (noise01(ph + 4.2) * 2.0 - 1.0));
+      const maxD     = maxDBase * rangeMul;
+      const invMax   = 1.0 / maxD;
+
       if (d > 1e-4 && d < maxD){
-        const t   = 1.0 - d * invMax;
-        const acc = strength * t;            // NO extra * s
+        const t   = 1.0 - d * invMax;              // 0..1 inside radius
+        const acc = strength01 * wobble * t;       // modulated strength
         const invd = 1.0 / d;
-        hsVel[b]   += dx * invd * acc * dts; // integrate with dts
+
+        hsVel[b]   += dx * invd * acc * dts;      // integrate with dts
         hsVel[b+1] += dy * invd * acc * dts;
         hsVel[b+2] += dz * invd * acc * dts;
       }
@@ -1893,6 +1931,7 @@ if (handSteamMat && handSteamMat.mapKind !== params.handSteamShape){
   handSteamMat.needsUpdate = true;
 }
 }
+
 
 
 
@@ -2387,13 +2426,33 @@ async function populateCameraList(force=false){
 function stopWS(){ if (ws){ try{ ws.close(); }catch{} ws=null; } wsConnected=false; setBarsState(); }
 function stopWebcam(){ if (camTimer) cancelAnimationFrame(camTimer); camTimer=null; if (camVideo){ camVideo.pause(); camVideo.srcObject=null; camVideo=null; } if (camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; } camCnv=camCtx=null; }
 
-function wsURLSameOrigin() {
-  const dev = new URLSearchParams(location.search).get("ws");
-  if (dev) return dev;
+// function wsURLSameOrigin() {
+//   const dev = new URLSearchParams(location.search).get("ws");
+//   if (dev) return dev;
+//   const proto = (location.protocol === "https:") ? "wss" : "ws";
+//       // Nginx exposes the tunnel at /livedepth-ws/
+//   return `${proto}://${location.host}/livedepth-ws/`;
+// }
+
+function wsURL() {
+  const qp = new URLSearchParams(location.search);
+  const forced = qp.get("ws");            // manual override
+  if (forced) return forced;
+
   const proto = (location.protocol === "https:") ? "wss" : "ws";
-      // Nginx exposes the tunnel at /livedepth-ws/
-  return `${proto}://${location.host}/livedepth-ws/`;
+
+  // When served from flaboy.com/livedepth → go through Nginx subpath
+  if (location.pathname.startsWith("/livedepth")) {
+    return `${proto}://${location.host}/livedepth-ws/`;
+  }
+
+  // Local app mode → talk straight to the WS server port
+  const port = Number(qp.get("port") || "8765");
+  const host = location.hostname;     // keep hostname; avoid mixing with :8443
+  return `${proto}://${host}:${port}/`;
 }
+
+
 
 function startWSStream(){
   stopWebcam(); stopWS();
@@ -2402,7 +2461,7 @@ function startWSStream(){
   const backoffBase = 500, backoffMax = 4000;
 
   const tryConnect = () => {
-    const url = wsURLSameOrigin();
+    const url = wsURL();  // <-- use the new function
     attempt++;
     statusText = `WS connecting ${url} (attempt ${attempt})`;
     overlay.classList.add("error");

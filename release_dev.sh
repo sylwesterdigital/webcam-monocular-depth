@@ -2,11 +2,8 @@
 # -----------------------------------------------------------------------------
 # LiveDepth — dev/beta release packager (no Apple dev account required)
 # - Builds with PyInstaller (auto-bumps BUILD_NUMBER via LiveDepth.spec)
-# - Reads the actual version + build from the built app's Info.plist
+# - Reads version + build from the built app's Info.plist
 # - Produces a versioned zip in ./release without touching dist/
-# - No Git, no external Python helpers, no signing
-#
-# Usage:  ./release_dev.sh
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -16,11 +13,11 @@ DIST_APP="dist/${APP_NAME}.app"
 PLIST="${DIST_APP}/Contents/Info.plist"
 RELEASE_DIR="release"
 
-# Optional: base marketing version if plist missing (only as last resort)
+# Optional: base marketing version if plist missing (last resort)
 FALLBACK_VERSION="$(cat VERSION.txt 2>/dev/null || echo '0.9.0-beta')"
-FALLBACK_BUILD="$(cat BUILD_NUMBER.txt 2>/devnull || echo '0')"
+FALLBACK_BUILD="$(cat BUILD_NUMBER.txt 2>/dev/null || echo '0')"
 
-# 1) Build (this also bumps BUILD_NUMBER in the spec)
+# 1) Build (also bumps BUILD_NUMBER in the spec)
 echo "🔨 Building with PyInstaller..."
 pyinstaller "${SPEC_FILE}" --noconfirm
 

@@ -28,7 +28,9 @@ TARGET_WIDTH = int(os.getenv("TARGET_WIDTH", "640"))
 STRIDE       = int(os.getenv("STRIDE", "2"))         # 1=full res; 2/3 reduces payload
 FOV_DEG      = float(os.getenv("FOV_DEG", "60.0"))
 PORT         = int(os.getenv("PORT", "8765"))
-BIND_HOST    = os.getenv("BIND_HOST", "localhost")   # <— no hardcoded IP; matches page host
+#BIND_HOST    = os.getenv("BIND_HOST", "localhost")   # <— no hardcoded IP; matches page host
+BIND_HOST    = os.getenv("BIND_HOST", "0.0.0.0")
+
 
 MODEL_TYPE   = os.getenv("MODEL_TYPE", "MiDaS_small")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
 #MODEL_TYPE   = os.getenv("MODEL_TYPE", "DPT_Hybrid")# "MiDaS_small" | "DPT_Large" | "DPT_Hybrid"
